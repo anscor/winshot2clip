@@ -27,9 +27,17 @@ $ErrorActionPreference = 'Stop'
 
 # ------------------------------------------------------------------ helpers --
 
+function Get-ClipboardFormatNames {
+    try {
+        $data = [System.Windows.Forms.Clipboard]::GetDataObject()
+        if ($null -eq $data) { return @() }
+        return @($data.GetFormats())
+    }
+    catch { return @() }
+}
+
 function Show-WhatIsOnTheClipboard {
-    $data = [System.Windows.Forms.Clipboard]::GetDataObject()
-    $formats = @($data.GetFormats())
+    $formats = Get-ClipboardFormatNames
     Write-Host ("    clipboard now holds {0} format(s):" -f $formats.Count)
     foreach ($f in $formats) { Write-Host ("      {0}" -f $f) }
     if ($formats.Count -eq 1 -and $formats[0] -eq 'FileDrop') {
@@ -314,7 +322,11 @@ $variants = @(
         Set  = { param($p) Set-ClipboardByRawDataObject -Path $p -WithDropEffect -WithFileNames }
     },
     @{
-        Name = 'D: FileDrop only (what the tool does today)'
+        Name = 'D: FileDrop + FileNameW + FileName (no DropEffect)'
+        Set  = { param($p) Set-ClipboardByRawDataObject -Path $p -WithFileNames }
+    },
+    @{
+        Name = 'E: FileDrop only (what the tool does today)'
         Set  = { param($p)
                      $list = New-Object System.Collections.Specialized.StringCollection
                      [void]$list.Add($p)
@@ -325,10 +337,13 @@ $variants = @(
 
 foreach ($variant in $variants) {
     Write-Host ('--- {0}' -f $variant.Name)
+
+    # The shell verb variant may set the clipboard asynchronously, so wait for
+    # the format list to actually change rather than trusting a fixed sleep.
+    # Otherwise a slow shell looks like a variant that set nothing.
+    $before = Get-ClipboardFormatNames
     try {
         & $variant.Set $File
-        Start-Sleep -Milliseconds 400
-        Show-WhatIsOnTheClipboard
     }
     catch {
         Write-Host ('    SETTING IT FAILED: {0}' -f $_.Exception.Message)
@@ -336,6 +351,17 @@ foreach ($variant in $variants) {
         Write-Host ''
         continue
     }
+
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 200
+        $after = Get-ClipboardFormatNames
+        if (@(Compare-Object -ReferenceObject $before -DifferenceObject $after -ErrorAction SilentlyContinue).Count -gt 0) { break }
+    }
+    if (@(Compare-Object -ReferenceObject $before -DifferenceObject (Get-ClipboardFormatNames) -ErrorAction SilentlyContinue).Count -eq 0) {
+        Write-Host '    (the clipboard did not change at all within 5s)'
+    }
+    Show-WhatIsOnTheClipboard
 
     $verdict = Wait-ForVerdict -Name $variant.Name
     [void]$results.Add([pscustomobject]@{ Variant = $variant.Name; Result = $verdict })
