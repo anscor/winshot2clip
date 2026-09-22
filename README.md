@@ -14,7 +14,7 @@ xrdp 的 `cliprdr` 通道只实现了**文本**和**文件列表**两种剪贴�
 |---|---|
 | `winshot2clip.ps1` | 主程序：监听目录 + 把新截图放进剪贴板 + 写日志 |
 | `start-hidden.vbs` | 无窗口启动器（避免每次登录黑窗口一闪） |
-| `tests/logic-tests.ps1` | 逻辑回归测试（184 项断言，不依赖 Windows，任意平台的 pwsh 都能跑） |
+| `tests/logic-tests.ps1` | 逻辑回归测试（190 项断言，不依赖 Windows，任意平台的 pwsh 都能跑） |
 
 两个脚本都是**纯 ASCII**，这是刻意的：Windows PowerShell 5.1 在没有 UTF-8 BOM 时按系统 ANSI 代码页解析 `.ps1`，非 ASCII 字符会变乱码。纯 ASCII 意味着**你用任何方式传输都不会出问题，包括直接从 RDP 剪贴板粘贴到记事本另存**。中文路径照样能用（命令行参数是 UTF-16）。
 
@@ -207,7 +207,7 @@ SourceEventArgs = System.IO.FileSystemEventArgs  ← 正确读取位置
 
 我在 NixOS 上，**没有 Windows 环境**，所以边界说清楚。
 
-**已实测（184 项断言，连跑三遍全绿、退出码 0，`tests/logic-tests.ps1`）**
+**已实测（190 项断言，连跑三遍全绿、退出码 0，`tests/logic-tests.ps1`）**
 
 其中约 60 项是审计之后补的回归断言，每一条锁一个具体缺陷。测试 harness 现在从生产源码里读配置值（`$script:Extensions` / `MaxAttempts` / `EventSource`），所以改生产配置会真的让测试跟着变——而不是继续默默地测旧值。
 

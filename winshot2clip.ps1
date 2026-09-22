@@ -428,21 +428,67 @@ function Set-ClipboardFileByShellVerb {
         explorer.exe, so the clipboard ends up holding exactly what a manual
         copy produces, including the Shell IDList Array that a hand-built data
         object could not reasonably reproduce.
+
+        The COM objects are released in a finally block. The watcher loops
+        forever, so leaking one Shell.Application per screenshot would pile up
+        for as long as the session lives.
     #>
     param([Parameter(Mandatory = $true)][string] $Path)
 
     $directory = Split-Path -Parent $Path
     $leaf      = Split-Path -Leaf $Path
 
-    $shell  = New-Object -ComObject Shell.Application
-    $folder = $shell.Namespace($directory)
-    if ($null -eq $folder) { throw "shell cannot open folder: $directory" }
+    $shell  = $null
+    $folder = $null
+    $item   = $null
 
-    $item = $folder.ParseName($leaf)
-    if ($null -eq $item) { throw "shell cannot find item: $leaf" }
+    try {
+        $shell  = New-Object -ComObject Shell.Application
+        $folder = $shell.Namespace($directory)
+        if ($null -eq $folder) { throw "shell cannot open folder: $directory" }
 
-    # The canonical verb name, not the localised menu text.
-    $item.InvokeVerb('copy')
+        $item = $folder.ParseName($leaf)
+        if ($null -eq $item) { throw "shell cannot find item: $leaf" }
+
+        # The canonical verb name, not the localised menu text.
+        $item.InvokeVerb('copy')
+    }
+    finally {
+        foreach ($comObject in @($item, $folder, $shell)) {
+            if ($null -eq $comObject) { continue }
+            try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObject) }
+            catch { }
+        }
+    }
+}
+
+function Wait-ClipboardToSettle {
+    <#
+        Give the clipboard a moment to go quiet before reading it.
+
+        A screenshot lands on the clipboard while the RDP client is also looking
+        at it, and the client holds the clipboard open while it does. Reading it
+        continuously through that window is how we end up fighting the client
+        for it -- which shows up as a copy that appears to fail and then
+        succeeds on the retry. So: wait until an open fails (meaning someone,
+        probably the client, has it), then wait a little longer.
+    #>
+    param([int] $MaxMilliseconds = 1500, [int] $StepMilliseconds = 50)
+
+    $deadline = (Get-Date).AddMilliseconds($MaxMilliseconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $null = [System.Windows.Forms.Clipboard]::GetDataObject()
+        }
+        catch {
+            # Someone else had it; that is the signal we were waiting for.
+            break
+        }
+        Start-Sleep -Milliseconds $StepMilliseconds
+    }
+
+    # Even when it never looked busy, do not read it again immediately.
+    Start-Sleep -Milliseconds 200
 }
 
 function Test-ClipboardHoldsFile {
@@ -451,6 +497,11 @@ function Test-ClipboardHoldsFile {
 
         Polled rather than assumed: InvokeVerb posts to explorer's message loop
         and returns before the copy has happened.
+
+        Deliberately modest: a handful of attempts with a few hundred
+        milliseconds between them. A shell copy of a local file is fast, and a
+        tighter loop would mean reading the clipboard while the RDP client is
+        reading it too.
     #>
     param(
         [Parameter(Mandatory = $true)][string] $Path,
@@ -463,7 +514,7 @@ function Test-ClipboardHoldsFile {
             if ($entry -eq $Path) { return $true }
         }
         if ((Get-Date) -ge $deadline) { return $false }
-        Start-Sleep -Milliseconds 100
+        Start-Sleep -Milliseconds 500
     }
 }
 
@@ -482,6 +533,9 @@ function Set-ClipboardForScreenshot {
     switch ($Mode) {
         'Shell' {
             Set-ClipboardFileByShellVerb -Path $Path
+            # Let the client finish whatever it is doing with the clipboard
+            # before we read it back.
+            Wait-ClipboardToSettle
             if (-not (Test-ClipboardHoldsFile -Path $Path)) {
                 throw "the shell did not put $Path on the clipboard"
             }

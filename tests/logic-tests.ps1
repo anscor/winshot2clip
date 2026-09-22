@@ -894,6 +894,36 @@ $holdsBody = $funcAst['Test-ClipboardHoldsFile'].Extent.Text
 Assert 'the verification polls (InvokeVerb returns before the copy happens)' ($holdsBody -match 'Start-Sleep')
 Assert 'and it has a bounded timeout' ($holdsBody -match 'AddSeconds')
 
+# The watcher loops forever, so a leaked Shell.Application per screenshot would
+# accumulate for the whole session.
+$shellVerbBody = $funcAst['Set-ClipboardFileByShellVerb'].Extent.Text
+Assert 'the shell COM objects are released' ($shellVerbBody -match 'ReleaseComObject')
+Assert 'and released from a finally block, so an exception cannot leak them' `
+       ($shellVerbBody -match '(?s)finally\s*\{.*ReleaseComObject')
+
+# Reading the clipboard with a tight loop fights the RDP client, which is also
+# reading it at that moment and holds it open while it does. Let it go quiet
+# first, and do the read-back at a human pace.
+$settleCall = @($funcAst['Set-ClipboardForScreenshot'].FindAll({
+    param($n) $n -is [System.Management.Automation.Language.CommandAst]
+}, $true))
+$settleIdx = -1
+$verifyIdx = -1
+for ($i = 0; $i -lt $settleCall.Count; $i++) {
+    $name = $settleCall[$i].GetCommandName()
+    if ($name -eq 'Wait-ClipboardToSettle' -and $settleIdx -lt 0) { $settleIdx = $i }
+    if ($name -eq 'Test-ClipboardHoldsFile' -and $verifyIdx -lt 0) { $verifyIdx = $i }
+}
+Assert 'Shell mode waits for the clipboard to settle before reading it back' ($settleIdx -ge 0)
+Assert 'and it settles BEFORE the read-back, not after' `
+       ($settleIdx -ge 0 -and $verifyIdx -ge 0 -and $settleIdx -lt $verifyIdx) `
+       "settle at $settleIdx, read-back at $verifyIdx"
+
+$settleBody = $funcAst['Wait-ClipboardToSettle'].Extent.Text
+Assert 'the settle wait is bounded' ($settleBody -match 'MaxMilliseconds')
+Assert 'the read-back polls at a human pace, not every 100ms' `
+       ($holdsBody -match 'Start-Sleep -Milliseconds 500')
+
 Section 'clipboard mode dispatch'
 
 # Drive Set-ClipboardForScreenshot directly, with the shell functions replaced,
