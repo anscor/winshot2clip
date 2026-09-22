@@ -2,11 +2,15 @@
 
 ## 它解决什么问题
 
-xrdp 的 `cliprdr` 通道只实现了**文本**和**文件列表**两种剪贴板格式，**没有实现位图（CF_DIB）**。所以 Windows 剪贴板里躺着一张图片时，它永远传不到 Nix 侧 —— 这就是"文字能同步、图片不能"的根因。
+你要的是：在 Windows 上截图，然后直接切到 RDP 里的 Nix 应用按 `Ctrl+V` 就能用。而你目前的习惯是「去截图目录找文件 → `Ctrl+C` → 远程 `Ctrl+V`」。
 
-但文件能传。你在资源管理器里选中文件按 `Ctrl+C`，剪贴板里放的是 `CF_HDROP`（文件路径列表），mstsc 会把它翻译成 CLIPRDR 的文件格式发给 xrdp，Linux 应用就能拿到。
+这个程序**只做一件事**：把中间那个手动步骤自动化。它监听截图目录，一发现新截图就把它以**文件**形式放进剪贴板。**你的截图工具仍然负责保存文件，程序不碰图片内容。**
 
-所以这个程序**只做一件事**：把"进资源管理器找文件 + Ctrl+C"这一步自动化。它监听截图目录，一发现新截图就把它以**文件**形式放进剪贴板 —— 和你手动操作产生的剪贴板内容完全一致，粘贴通路一点没变。
+默认做法是让**资源管理器自己执行这次复制**（`-ClipboardMode Shell`）：`Shell.Application` 是跑在 `explorer.exe` 里的 out-of-process COM 服务，要求它执行文件的 `copy` 动词，就等于你在资源管理器里选中文件按 `Ctrl+C`：同一条代码路径、同样一份剪贴板内容（连 `SetFileDropList` 构造不出的 `Shell IDList Array` 都一并带上），粘贴通路一点没变。
+
+> **历史记录，避免重蹈覆辙。** 本项目早期版本的前提是「xrdp 不支持图片剪贴板」。**那个判断是错的**——拆开 xrdp 0.10.6 的 `chansrv` 可以看到它支持 `image/bmp`（不支持 `image/png`）。做文件这条路是因为你的需求是自动化文件复制，不是为了绕开“不支持图片”。
+>
+> 同样被实测推翻的还有两条：非 ASCII 文件名截断（上游 issue #1992）不是故障根因；「文件列表会拖死剪贴板」是**客户端侧**的剪贴板占用问题，不是服务端解析问题。详见 `AUDIT.md` 的 A22/A23。
 
 ## 文件清单
 
@@ -14,7 +18,7 @@ xrdp 的 `cliprdr` 通道只实现了**文本**和**文件列表**两种剪贴�
 |---|---|
 | `winshot2clip.ps1` | 主程序：监听目录 + 把新截图放进剪贴板 + 写日志 |
 | `start-hidden.vbs` | 无窗口启动器（避免每次登录黑窗口一闪） |
-| `tests/logic-tests.ps1` | 逻辑回归测试（190 项断言，不依赖 Windows，任意平台的 pwsh 都能跑） |
+| `tests/logic-tests.ps1` | 逻辑回归测试（193 项断言，不依赖 Windows，任意平台的 pwsh 都能跑） |
 
 两个脚本都是**纯 ASCII**，这是刻意的：Windows PowerShell 5.1 在没有 UTF-8 BOM 时按系统 ANSI 代码页解析 `.ps1`，非 ASCII 字符会变乱码。纯 ASCII 意味着**你用任何方式传输都不会出问题，包括直接从 RDP 剪贴板粘贴到记事本另存**。中文路径照样能用（命令行参数是 UTF-16）。
 
@@ -42,7 +46,7 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\winshot2clip.ps1 
 
 | 阶段 | 验什么 |
 |---|---|
-| 环境 | 监听目录是否存在；**目录里有没有匹配 `Screenshot*` 的文件**（不匹配就把实际文件名打出来）；是否 STA |
+| 环境 | 监听目录是否存在；**目录里有没有匹配过滤器（默认含中文前缀）的文件**（不匹配就把实际文件名打出来）；是否 STA |
 | 扫描通路 | 造一张真 PNG → 扫描发现它 → 放进剪贴板 → **读回剪贴板确认** → 再扫一遍确认不重复复制 |
 | 事件通路 | 武装一个真 `FileSystemWatcher` → 造第二张 PNG → 等事件队列驱动它 → 放进剪贴板 → **读回剪贴板确认** |
 
@@ -68,20 +72,97 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\winshot2clip.ps1
 
 第 3 步成功 = 整条链路通了。
 
-### 4. 设为开机自启
+### 4. 后台运行与开机自启
 
-1. 双击 `start-hidden.vbs`，确认进程起来了、**没有黑窗口一闪**：
-   ```powershell
-   Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
-     Where-Object { $_.CommandLine -like '*winshot2clip.ps1*' } |
-     Select-Object ProcessId, CommandLine
-   ```
-2. `Win+R` → `shell:startup` → 回车
-3. 在打开的文件夹里新建 `start-hidden.vbs` 的**快捷方式**（右键 → 新建 → 快捷方式，目标填 `%USERPROFILE%\tools\winshot2clip\start-hidden.vbs`；若向导不展开变量，就填实际路径）
+#### 先确认它能无窗口地跑起来
 
-`start-hidden.vbs` 用 `WScript.Shell.Run` 的隐藏窗口模式启动，并且按它自身的所在目录去找 `.ps1`，所以放快捷方式、移动目录都不会坏。
+双击 `start-hidden.vbs`，窗口不应出现任何黑框一闪。确认进程在：
 
-程序内部有一个命名互斥体，重复启动（例如自启了一次你手动又点一次）不会出现两个实例互相抢剪贴板。
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+  Where-Object { $_.CommandLine -like '*winshot2clip.ps1*' } |
+  Select-Object ProcessId, CommandLine
+```
+
+`start-hidden.vbs` 做两件事：用 `WScript.Shell.Run` 的**隐藏窗口模式**（`0`）启动，并且**按自身所在目录**去找 `.ps1`（所以放快捷方式、移动目录都不会坏）。
+
+> 注意：`powershell.exe -WindowStyle Hidden` **不够**，启动时仍会闪一下黑框。真正起作用的是 `WScript.Shell.Run` 的窗口样式 `0`。
+
+#### 停止正在跑的程序
+
+```powershell
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+  Where-Object { $_.CommandLine -like '*winshot2clip.ps1*' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId }
+```
+
+程序内部有一个命名互斥体，重复启动（例如自启了一次你手动又点一次）不会出现两个实例互相抢剪贴板——第二次启动会自己退出并在日志里记一行。
+
+#### 方式一：启动文件夹（最简单）
+
+1. `Win+R` → 输入 `shell:startup` → 回车
+2. 在打开的文件夹里新建 `start-hidden.vbs` 的**快捷方式**：右键 → 新建 → 快捷方式，目标填
+   `%USERPROFILE%\tools\winshot2clip\start-hidden.vbs`
+   （向导若不展开 `%USERPROFILE%`，就直接填实际路径）
+
+**生效时机**：登录后约 10–60 秒（Windows 会错开启动项）。
+
+**好处**：不请求提权、不需要管理员、文件就在你自己的 profile 下。
+
+#### 方式二：计划任务（更可控，推荐）
+
+比启动文件夹多两个好处：**只跑一份**（即使你为了别的目的登录两次）、**失败可查**（有上次运行结果）。
+
+用管理员 PowerShell 跑（把 `$ps1` 换成你的实际路径）：
+
+```powershell
+$vbs = "$env:USERPROFILE\tools\winshot2clip\start-hidden.vbs"
+
+$action  = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbs`""
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -MultipleInstances IgnoreNew `
+    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+Register-ScheduledTask -TaskName 'winshot2clip' `
+    -Action $action -Trigger $trigger -Settings $settings `
+    -Description '把新截图放进剪贴板，以便在 RDP 会话里粘贴' -Force
+```
+
+几个参数为什么这么写：
+
+| 参数 | 原因 |
+|---|---|
+| `-Execute 'wscript.exe'` | 由 WScript 启动，才能拿到隐藏窗口。直接跑 `powershell.exe` 会闪黑框 |
+| `-AtLogOn -User $env:USERNAME` | 只在这个用户登录时触发，不用管理员权限运行 |
+| `-MultipleInstances IgnoreNew` | 与程序内部的互斥体双重保险，不会出现两个实例抢剪贴板 |
+| `-ExecutionTimeLimit ([TimeSpan]::Zero)` | **必须设**。默认计划任务会在 3 天后强制结束，而这个程序本来就要一直跑 |
+| `-RestartCount 3` | 万一进程意外挂掉，1 分钟后自动重拉（不在电池上停） |
+
+**不要**勾选“使用最高权限运行”：程序不需要提权，以普通用户身份跑访问剪贴板更自然。
+
+验证 / 管理：
+
+```powershell
+Get-ScheduledTask -TaskName 'winshot2clip' | Get-ScheduledTaskInfo   # 上次运行结果
+Start-ScheduledTask -TaskName 'winshot2clip'                          # 立即启动
+Disable-ScheduledTask -TaskName 'winshot2clip'                        # 暂停自启
+Unregister-ScheduledTask -TaskName 'winshot2clip' -Confirm:$false     # 删掉
+```
+
+#### 选哪个
+
+| | 启动文件夹 | 计划任务 |
+|---|---|---|
+| 配置难度 | 拖一个快捷方式 | 跑一段命令 |
+| 防止重复实例 | 靠程序内部互斥体 | 两层保障 |
+| 崩溃后自动重拉 | ✗ | ✓ |
+| 失败可查 | ✗（只能看日志） | ✓（有上次运行结果） |
+| 需要管理员 | ✗ | 仅注册时需要 |
+
+日常用**启动文件夹**就够了；如果你会多次登录同一账户、或希望它挂掉后自己起来，用**计划任务**。两者不要同时配，否则虽然不会真出两个实例（有互斥体），但会互相抢着启动、在日志里留下多余的“already running”行。
 
 ## 排查
 
@@ -179,9 +260,9 @@ Windows 的截图文件名**按系统语言**生成，所以中文安装上每�
 
 注意：**这只是改善上游解析器读到的名字长度，不能修复上游服务器侧的卡死**。如果你实际遇到的是“第一张能粘、之后都不行、连文字也一起死”且重连才恢复，那是客户端剪贴板被长期占住（Windows 事件日志里会看到 `SetFileDropList` 报“所请求的剪贴板操作失败”，即 `CLIPBRD_E_CANT_OPEN`），换模式未必能解决——先确认 `Shell` 模式重连后的实际表现。
 
-## 平台行为探测记录（在 Linux/inotify 上做的，Windows 待验证）
+## 开发时探测到的平台行为（保留备查）
 
-下面这三条是我写代码前后**实际探测**出来的（不是文档抄来的），但探测环境是 **Linux 的 inotify**——我手上没有 Windows。`ReadDirectoryChangesW` 的投递语义、缓冲区溢出行为、名子配对规则都可能不同，所以这三条在 Windows 上都要重新确认。第 3 条与平台无关，可以直接信。
+下面这几条是开发过程中**实际探测**出来的，不是文档抄来的。注意探测环境是 **Linux 的 inotify**（我手上没有 Windows），所以涉及投递语义的部分后来在真实 Windows 上做了复核，结果标在每条后面。
 
 **1. 事件载荷在 `SourceEventArgs` 上，不在 `SourceArgs[0]` 上。**
 ```
@@ -191,23 +272,25 @@ SourceEventArgs = System.IO.FileSystemEventArgs  ← 正确读取位置
 ```
 读 `SourceArgs[0].Name` 会拿到空字符串，表现是"程序在跑但什么都不复制"。代码里用的是 `$evt.SourceEventArgs.FullPath`。
 
-**2. 在 Linux 上，带 `Filter` 时改名进目录的文件会被报成 `Created` 而不是 `Renamed`。**
+**2. 带 `Filter` 时，改名进监听目录的文件会被报成 `Created` 而不是 `Renamed`。**
 
-观察到的现象是：临时文件名不匹配过滤器时，.NET 配不上"旧名→新名"，就只报新名那一端（且 `ChangeType` 是 `Created`）。
+在 Linux/inotify 上观察到的原因：临时文件名不匹配过滤器时，.NET 配不上“旧名→新名”，就只报新名那一端，`ChangeType` 为 `Created`。
 
-**但这一条在 Windows 上未验证，而且残留一个真实风险**：如果 Windows 上 .NET 在这种情况下干脆**丢掉整条通知**，那么"写临时名再改名"型截图工具就只能靠 60 秒兜底扫描抄到，配 `-ReconcileSeconds 0` 则**永远抄不到**。测试里那条"改名进目录的文件会被复制"（`tests/logic-tests.ps1`）断言的是**结果**，不是事件名——它证明不了 Windows 上的投递行为。
+当时这留下一个真实风险：如果 Windows 上 .NET 在这种情况下干脆**丢掉整条通知**，那么“写临时名再改名”型截图工具就只能靠 60 秒兜底扫描抄到，配 `-ReconcileSeconds 0` 则永远抄不到。测试里那条“改名进目录的文件会被复制”断言的是**结果**不是事件名，证明不了 Windows 上的投递行为。
 
-好在代码对两种事件都订阅、都用 `FullPath`，所以只要通知能到就一定处理对；风险只在"通知可能整条不到"。如果 `-SelfTest` 的报告里出现 `reconciliation scan picked up`，就是撞上了这一类。
+**已在真实 Windows + 中文系统上复核：风险不存在。** 连续截图均正常命中，无需要等兜底扫描。代码对 `Created` 和 `Renamed` 都订阅、都用 `FullPath`，所以只要通知能到就一定处理对。如果日志里出现 `reconciliation scan picked up ...`，才说明撞上了“通知整条不到”这一类。
 
 **3. `NotifyFilter = FileName` 不会报告目录创建事件。**（这条与平台无关，可以直接信：`FileName` 映射到 `FILE_NOTIFY_CHANGE_FILE_NAME`，只覆盖文件，目录要 `DirectoryName`）所以新子目录根本不会产生事件 —— 而且这样更好：内核缓冲区不用为无关事件占位。代码里对目录的防御（`Test-Path -PathType Leaf`）是第二道保险，测试用合成事件单独验证过它有效。
 
-**4. 截图文件名是按系统语言本地化的。**（这条是**实测**，就是在中文 Windows 上发现的：中文安装写 `屏幕截图 2026-09-22 224547.png`）同理，任何依赖英文前缀的假设都是错的。而且**非 ASCII 名字会触发上游 xrdp 的解析器 bug**（issue #1992），见上文“为什么默认要先把截图复制成 ASCII 文件名的副本”。
+**4. 截图文件名是按系统语言本地化的。**（这条是**实测**，就是在中文 Windows 上发现的：中文安装写 `屏幕截图 2026-09-22 224547.png`）同理，任何依赖英文前缀的假设都是错的。这一点已在默认 `-Filter` 里处理（同时接受 `Screenshot*` 与中文前缀），属于**已验证并修复**。
 
 ## 已验证 / 待验证
 
-我在 NixOS 上，**没有 Windows 环境**，所以边界说清楚。
+**状态：已在真实环境测试成功。** Windows（中文系统）+ mstsc + xrdp + Nix 应用，连续截图并远程粘贴均正常，已确认可用。
 
-**已实测（190 项断言，连跑三遍全绿、退出码 0，`tests/logic-tests.ps1`）**
+我在 NixOS 上开发，**手上没有 Windows**，所以下面区分“跨平台自动化测试覆盖的”和“依赖真实环境确认的”。
+
+**跨平台自动化测试：193 项断言，连跑三遍全绿、退出码 0（`tests/logic-tests.ps1`）**
 
 其中约 60 项是审计之后补的回归断言，每一条锁一个具体缺陷。测试 harness 现在从生产源码里读配置值（`$script:Extensions` / `MaxAttempts` / `EventSource`），所以改生产配置会真的让测试跟着变——而不是继续默默地测旧值。
 
@@ -215,6 +298,8 @@ SourceEventArgs = System.IO.FileSystemEventArgs  ← 正确读取位置
 
 环境与兼容性：
 - 脚本语法解析无错误；纯 ASCII、无 BOM、不含 PowerShell 7 专有运算符（5.1 兼容性护栏）
+
+- 资格判定兼容本地化命名：中文前缀用码点构造并钉死在具体码点上，真文件落盘后能端到端被扫描复制
 
 资格判定：
 - 只认 `Screenshot*.png/jpg/jpeg`；其他文件名、非白名单扩展、无扩展名、目录、不存在的路径、空路径一律拒绝；大写 `.PNG` 正常识别
@@ -245,25 +330,40 @@ SourceEventArgs = System.IO.FileSystemEventArgs  ← 正确读取位置
 - 待重试文件在下一轮被自动重试并清除
 - 所有测试 watcher 都正确注销，无事件订阅泄漏
 
-**未验证，需要你在 Windows 上确认（就是第 2、3 步做的事）**
+**这几项现在都已确认可用**（真实环境跑通：连续截图 + 远程粘贴）
 
-- `Add-Type -AssemblyName System.Windows.Forms` 能加载
-- `Clipboard::SetFileDropList()` 实际写入成功、且读回一致（自检覆盖）
-- STA 公寓检查（自检覆盖）
-- `FileSystemWatcher` 真实的 `Created`/`Renamed` 事件在 Windows 上的具体投递行为（自检覆盖）。**特别是**：如果 Windows 上 .NET 在名子配不上时直接丢掉通知，那么"写临时名再改名"型截图工具就只能靠兜底扫到（见上文平台探测记录第 2 条）
-- **`Error` 事件在真实缓冲区溢出时到底会不会触发**。我在 Linux 上用最小 8KB 缓冲区灌 600 个文件，**Error 事件 0 次**——那是 inotify，不能代表 Windows 的 `ReadDirectoryChangesW`。代码对 Error 的处理逻辑是验证过的，"它会触发"这件事没有
+- `Add-Type -AssemblyName System.Windows.Forms` 能加载；`Shell` 模式经由 `Shell.Application` 完成复制
+- STA 公寓检查通过；自检的扫描与事件两条通路均走通
+- `FileSystemWatcher` 在 Windows 上的 `Created`/`Renamed` 投递行为正常（中文名截图能被事件拉起）
 - `start-hidden.vbs` 无窗口启动；命名互斥体不误判
-- **最后也是最重要的一环**：xrdp 把这张图送到 Linux 应用里
+- **xrdp 能把这张图送进 Linux 应用**（粘贴成功）
 
-## 如果"日志有 clipboard set 但远程粘不出来"
+**仍未验证（不影响日常使用，但记录在此）**
 
-这是本方案唯一剩下的理论风险点：Explorer 的 `Ctrl+C` 除 `CF_HDROP` 外还会附带一个 `Preferred DropEffect`（值为 COPY），而 `SetFileDropList()` 不设置它。理论上不影响（xrdp 的 chansrv 走 `FileGroupDescriptorW` / `FileContents` 请求，不看这个格式），但没法在 Windows 上实测。
+- **`Error` 事件在真实缓冲区溢出时到底会不会触发**。我在 Linux 上用最小 8KB 缓冲区灌 600 个文件，**Error 事件 0 次**——那是 inotify，不能代表 Windows 的 `ReadDirectoryChangesW`。代码对 Error 的处理逻辑是验证过的（合成事件），“它会触发”这件事没有。即使它不触发，`-ReconcileSeconds` 兜底也能兵住
+- 如果 Windows 上 .NET 在“旧名不匹配过滤器”时直接**丢掉整条通知**，那么“写临时名再改名”型截图工具就只能靠兜底扫到。你的截图工具不属此类（实测正常）
 
-万一真遇到，排查顺序：
+## 如果远程粘不出来
 
-1. 先确认不是 xrdp 侧的问题：Nix 侧看 `/var/log/xrdp-chansrv.log` 或 `journalctl -u xrdp -f`，粘贴时有没有文件传输相关报错。xrdp 的 C2S 文件剪贴板对某些应用（历史上 Nautilus 3.38）就是不兼容 —— 换个应用（Thunar、浏览器输入框）试试，能区分"程序没复制"和"这个应用粘不了"。
-2. 确认不是应用问题：Nix 侧开个能收文件的程序（文件管理器）`Ctrl+V`，看能不能落下一个文件。能落下说明剪贴板是好的，是目标应用不接受文件形式的粘贴。
-3. 如果确实缺 `Preferred DropEffect`，补它需要自定义 `IDataObject`（`DataObject::SetData` 传 `MemoryStream` 会被序列化成 `SerializedObject` 包装，不是裸字节，这是经典坑），大概 40 行 C# 通过 `Add-Type` 内联。到时候告诉我，我加。
+默认的 `Shell` 模式已经让资源管理器执行与手动 `Ctrl+C` 完全相同的复制，所以“程序复制的东西和手动不一样”这个差异已经被消除了。如果仍然粘不出来，按下面顺序排查。
+
+**先区分是“没复制”还是“粘不了”：**
+
+1. 看日志最后一行是不是 `clipboard set [Shell]: ...`。没有就去查上文的排查表。
+2. 在 Windows 本地先验一次：粘贴到另一个本地文件夹能落下一个文件吗？不能就是复制本身没生效。
+3. Nix 侧确认剪贴板上到底有什么：
+   ```bash
+   nix-shell -p xclip --run 'xclip -selection clipboard -o -t TARGETS'
+   ```
+   出现 `text/uri-list` 或 `x-special/gnome-copied-files` 说明文件已经跨过 RDP；只出现 `STRING`/`UTF8_STRING` 说明没过来。
+
+**根据结果分头处理：**
+
+- **文件没过来**：看 Nix 侧 `/var/log/xrdp-chansrv.log` 或 `journalctl -u xrdp -f`，粘贴时有无文件传输报错。xrdp 的 C2S 文件剪贴板对某些应用（历史上 Nautilus 3.38）不兼容——换个应用（Thunar、浏览器输入框）试，能区分“程序没复制”和“这个应用粘不了”。
+- **文件过来了但目标应用粘不出来**：那个应用不接受文件形式的粘贴。xrdp 会把剪贴板文件落到本地临时目录，可以先把文件取到本地再打开。
+- **整个剪贴板都失效（连文字也不同步）**：这是客户端侧剪贴板被长期占用，断开 RDP 重连即可恢复。这个问题的实测记录见 `AUDIT.md` 的 A22。
+
+**已不再需要担心的一点：** 早期版本曾担心 `SetFileDropList()` 不设置 `Preferred DropEffect`（Explorer 的 `Ctrl+C` 会附带）会被 mstsc 拒绝。改用 `Shell` 模式后这个问题不存在了——`Shell` 模式产出的剪贴板内容与手动复制一致。
 
 ## 跑逻辑测试
 
