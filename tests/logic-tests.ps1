@@ -135,14 +135,25 @@ function Get-ProductionScriptVar {
     return & ([scriptblock]::Create($assignment.Right.Extent.Text))
 }
 
+function Get-ProductionParamDefault {
+    param($ScriptAst, [string] $Name)
+    if ($null -eq $ScriptAst.ParamBlock) { return $null }
+    $p = @($ScriptAst.ParamBlock.Parameters |
+           Where-Object { $_.Name.VariablePath.UserPath -eq $Name }) | Select-Object -First 1
+    if ($null -eq $p -or $null -eq $p.DefaultValue) { return $null }
+    return & ([scriptblock]::Create($p.DefaultValue.Extent.Text))
+}
+
 $prodExtensions  = @(Get-ProductionScriptVar -ScriptAst $ast -Name 'Extensions')
 $prodMaxAttempts = Get-ProductionScriptVar -ScriptAst $ast -Name 'MaxAttempts'
 $prodEventSource = Get-ProductionScriptVar -ScriptAst $ast -Name 'EventSource'
+$prodFilter      = @(Get-ProductionParamDefault -ScriptAst $ast -Name 'Filter')
 
 Section 'harness configuration comes from production'
 Assert 'production $script:Extensions was read from the source' ($prodExtensions.Count -gt 0) "got $($prodExtensions.Count)"
 Assert 'production $script:MaxAttempts was read from the source' ($null -ne $prodMaxAttempts)
 Assert 'production $script:EventSource was read from the source' (-not [string]::IsNullOrEmpty($prodEventSource))
+Assert 'production -Filter default was read from the param block' ($prodFilter.Count -gt 0) "got $($prodFilter.Count)"
 
 $prodExtensionList = ($prodExtensions | ForEach-Object { "'$_'" }) -join ', '
 
@@ -374,12 +385,14 @@ $dirE = New-TestDir 'events'
 $seenE    = @{}
 $pendingE = @{}
 $srcE = 'LogicTestEvent'
-$watcherE = New-ScreenshotWatcher -Dir $dirE -Pattern 'Screenshot*' -EventSource $srcE
+$watcherE = New-ScreenshotWatcher -Dir $dirE -EventSource $srcE
 try {
     Assert 'the watcher is armed' ($watcherE.EnableRaisingEvents)
     Assert 'the watcher uses the maximum kernel buffer' ($watcherE.InternalBufferSize -eq 65536)
     Assert 'only FileName changes are subscribed' `
            ($watcherE.NotifyFilter -eq [System.IO.NotifyFilters]::FileName)
+    Assert 'the watcher takes every filename and leaves matching to Test-ScreenshotPath' `
+           ($watcherE.Filter -eq '*') "got '$($watcherE.Filter)'"
 
     # A Created event on a file that matches the filter.
     $e1 = New-Probe $dirE 'Screenshot event1.png'
@@ -391,12 +404,16 @@ try {
     Assert 'and it is marked seen' ($seenE.ContainsKey($e1))
     Assert 'and no scan was needed' (-not $r.NeedScan)
 
-    # A file that does not match the filter must not reach us at all.
+    # FileSystemWatcher.Filter takes a single wildcard and the default filter
+    # list has two, so the watcher now sees every file and the eligibility
+    # check is what rejects it. What matters is that nothing reaches the
+    # clipboard.
     $callsBefore = $global:Calls.Count
     $null = New-Probe $dirE 'holiday-event.png'
     $r = Invoke-EventCycle -Pattern 'Screenshot*' -Seen $seenE -Pending $pendingE `
                            -TimeoutSeconds 2 -EventSource $srcE -SettleTimeoutMs 2000
-    Assert 'a non-matching file raises no event' ($r.Handled -eq 0) "handled=$($r.Handled)"
+    Assert 'a non-matching file raises an event that is then rejected' `
+           ($r.Handled -ge 1 -and $r.Copied -eq 0) "handled=$($r.Handled) copied=$($r.Copied)"
     Assert 'and nothing was copied' ($global:Calls.Count -eq $callsBefore)
 
     # A file that was renamed into the folder (the temp-file-then-rename
@@ -448,7 +465,7 @@ Section 'an idle cycle'
 # be sitting in the queue and make an idle cycle look busy.
 $dirIdle     = New-TestDir 'idle'
 $srcIdle     = 'LogicTestIdle'
-$watcherIdle = New-ScreenshotWatcher -Dir $dirIdle -Pattern 'Screenshot*' -EventSource $srcIdle
+$watcherIdle = New-ScreenshotWatcher -Dir $dirIdle -EventSource $srcIdle
 try {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $r = Invoke-EventCycle -Pattern 'Screenshot*' -Seen @{} -Pending @{} `
@@ -472,7 +489,7 @@ $dirW = New-TestDir 'iteration'
 $seenW    = @{}
 $pendingW = @{}
 $srcW = 'LogicTestIteration'
-$watcherW = New-ScreenshotWatcher -Dir $dirW -Pattern 'Screenshot*' -EventSource $srcW
+$watcherW = New-ScreenshotWatcher -Dir $dirW -EventSource $srcW
 try {
     $null = New-Probe $dirW 'Screenshot w1.png'
     $it = Invoke-WatchIteration -Dir $dirW -Pattern 'Screenshot*' -Seen $seenW -Pending $pendingW `
@@ -494,7 +511,7 @@ $missed = New-Probe $dirW2 'Screenshot missed.png'
 $seenW2    = @{}          # deliberately primed empty: we pretend we never saw it
 $pendingW2 = @{}
 $srcW2 = 'LogicTestBackstop'
-$watcherW2 = New-ScreenshotWatcher -Dir $dirW2 -Pattern 'Screenshot*' -EventSource $srcW2
+$watcherW2 = New-ScreenshotWatcher -Dir $dirW2 -EventSource $srcW2
 try {
     $global:Calls.Clear()
     $it = Invoke-WatchIteration -Dir $dirW2 -Pattern 'Screenshot*' -Seen $seenW2 -Pending $pendingW2 `
@@ -515,7 +532,7 @@ $missed3 = New-Probe $dirW3 'Screenshot missed3.png'
 $seenW3    = @{}
 $pendingW3 = @{}
 $srcW3 = 'LogicTestNoBackstop'
-$watcherW3 = New-ScreenshotWatcher -Dir $dirW3 -Pattern 'Screenshot*' -EventSource $srcW3
+$watcherW3 = New-ScreenshotWatcher -Dir $dirW3 -EventSource $srcW3
 try {
     $global:Calls.Clear()
     $it = Invoke-WatchIteration -Dir $dirW3 -Pattern 'Screenshot*' -Seen $seenW3 -Pending $pendingW3 `
@@ -534,7 +551,7 @@ $missed4 = New-Probe $dirW4 'Screenshot missed4.png'
 $seenW4    = @{}
 $pendingW4 = @{}
 $srcW4 = 'LogicTestErrorForce'
-$watcherW4 = New-ScreenshotWatcher -Dir $dirW4 -Pattern 'Screenshot*' -EventSource $srcW4
+$watcherW4 = New-ScreenshotWatcher -Dir $dirW4 -EventSource $srcW4
 try {
     $null = New-Event -SourceIdentifier ($srcW4 + '.Error')
     $global:Calls.Clear()
@@ -556,7 +573,7 @@ $w5 = New-Probe $dirW5 'Screenshot w5.png'
 $seenW5    = @{}
 $pendingW5 = @{}
 $srcW5 = 'LogicTestRetryWire'
-$watcherW5 = New-ScreenshotWatcher -Dir $dirW5 -Pattern 'Screenshot*' -EventSource $srcW5
+$watcherW5 = New-ScreenshotWatcher -Dir $dirW5 -EventSource $srcW5
 try {
     $global:Calls.Clear()
     # Queue something as pending by hand, as a failed copy would.
@@ -619,7 +636,7 @@ Section 'A1: the drain follows the -EventSource it is handed'
 
 $dirSrc      = New-TestDir 'eventsource'
 $srcExplicit = 'AuditFixExplicitSource'
-$watcherSrc  = New-ScreenshotWatcher -Dir $dirSrc -Pattern 'Screenshot*' -EventSource $srcExplicit
+$watcherSrc  = New-ScreenshotWatcher -Dir $dirSrc -EventSource $srcExplicit
 try {
     $null = New-Probe $dirSrc 'Screenshot src.png'
     # $script:EventSource is $prodEventSource, so this only works if the drain
@@ -636,7 +653,7 @@ try {
     $dirSrc2 = New-TestDir 'eventsource-mismatch'
     $null = New-Probe $dirSrc2 'Screenshot src2.png'
     $srcOther = 'AuditFixOtherSource'
-    $watcherSrc2 = New-ScreenshotWatcher -Dir $dirSrc2 -Pattern 'Screenshot*' -EventSource $srcOther
+    $watcherSrc2 = New-ScreenshotWatcher -Dir $dirSrc2 -EventSource $srcOther
     try {
         $mismatch = Invoke-WatchIteration -Dir $dirSrc2 -Pattern 'Screenshot*' -Seen @{} -Pending @{} `
                                           -ReconcileSeconds 0 -EventTimeoutSeconds 1 `
@@ -765,6 +782,53 @@ foreach ($pattern in @('Screenshot*', 'Snip*', '*.png', '*Screenshot*')) {
            ((Invoke-ScanPass -Dir $dirProbe -Pattern $pattern -Seen $seenProbe -Pending $pendingProbe -SettleTimeoutMs 3000) -eq 1)
     Remove-Item -LiteralPath $probePath -Force
 }
+
+Section 'localised screenshot names (a Chinese Windows writes these)'
+
+# Spelled with code points because this file is ASCII-only for the same reason
+# the script is: 0x5C4F 0x5E55 0x622A 0x56FE is the Chinese for "screen shot".
+$localisedPrefix = -join @([char]0x5C4F, [char]0x5E55, [char]0x622A, [char]0x56FE)
+$localisedName   = '{0} 2026-09-22 224547.png' -f $localisedPrefix
+
+Assert 'the default filter is not English-only' `
+       (Test-NameMatchesPattern -Name $localisedName -Pattern $prodFilter) `
+       "filter is: $($prodFilter -join ' | ')"
+Assert 'and it still covers the English naming' `
+       (Test-NameMatchesPattern -Name 'Screenshot 2026-09-22 224547.png' -Pattern $prodFilter)
+
+# Pin the exact characters instead of trusting the code-point expression above.
+$localisedPattern = @($prodFilter | Where-Object { $_ -like "$localisedPrefix*" })[0]
+Assert 'the default filter contains the localised prefix pattern' ($null -ne $localisedPattern) `
+       "filter is: $($prodFilter -join ' | ')"
+Assert 'and that pattern is exactly those four code points plus a wildcard' `
+       ($localisedPattern.Length -eq 5 -and
+        [int][char]($localisedPattern[0]) -eq 0x5C4F -and
+        [int][char]($localisedPattern[1]) -eq 0x5E55 -and
+        [int][char]($localisedPattern[2]) -eq 0x622A -and
+        [int][char]($localisedPattern[3]) -eq 0x56FE -and
+        $localisedPattern[4] -eq '*') "got '$localisedPattern'"
+
+# End to end under the production default filter, with the exact name shape
+# reported from a Chinese Windows installation.
+$dirLocale = New-TestDir 'localised'
+$localisedPath = Join-Path $dirLocale $localisedName
+[IO.File]::WriteAllBytes($localisedPath, [Convert]::FromBase64String($ProbePng))
+
+Assert 'such a file is eligible' (Test-ScreenshotPath -Path $localisedPath -Pattern $prodFilter)
+Assert 'it is listed by a scan' (@(Get-ScreenshotListing -Dir $dirLocale -Pattern $prodFilter).Count -eq 1)
+
+$global:Calls.Clear()
+$seenLoc = @{}
+$pendingLoc = @{}
+Assert 'a scan pass copies it' `
+       ((Invoke-ScanPass -Dir $dirLocale -Pattern $prodFilter -Seen $seenLoc -Pending $pendingLoc -SettleTimeoutMs 3000) -eq 1)
+Assert 'and the clipboard got exactly that path' ($global:Calls.Count -eq 1 -and $global:Calls[0] -eq $localisedPath)
+Assert 'the directory diagnostic reports it as a match' `
+       (@(Get-WatchDirDiagnostic -Dir $dirLocale -Pattern $prodFilter) |
+        Where-Object { $_ -like 'OK:*match*' }).Count -eq 1
+Assert 'and -SelfTest can build both probes for the default filter' `
+       ($null -ne (Get-ProbeName -Pattern $prodFilter -Stamp '20260922-224547' -Kind 'scan') -and
+        $null -ne (Get-ProbeName -Pattern $prodFilter -Stamp '20260922-224547' -Kind 'event'))
 
 Section 'A16: the watcher is armed before the baseline is primed'
 

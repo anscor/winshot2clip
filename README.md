@@ -14,7 +14,7 @@ xrdp 的 `cliprdr` 通道只实现了**文本**和**文件列表**两种剪贴�
 |---|---|
 | `winshot2clip.ps1` | 主程序：监听目录 + 把新截图放进剪贴板 + 写日志 |
 | `start-hidden.vbs` | 无窗口启动器（避免每次登录黑窗口一闪） |
-| `tests/logic-tests.ps1` | 逻辑回归测试（140 项断言，不依赖 Windows，任意平台的 pwsh 都能跑） |
+| `tests/logic-tests.ps1` | 逻辑回归测试（152 项断言，不依赖 Windows，任意平台的 pwsh 都能跑） |
 
 两个脚本都是**纯 ASCII**，这是刻意的：Windows PowerShell 5.1 在没有 UTF-8 BOM 时按系统 ANSI 代码页解析 `.ps1`，非 ASCII 字符会变乱码。纯 ASCII 意味着**你用任何方式传输都不会出问题，包括直接从 RDP 剪贴板粘贴到记事本另存**。中文路径照样能用（命令行参数是 UTF-16）。
 
@@ -106,7 +106,7 @@ powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\winshot2clip.ps1
 
 | 现象 | 原因 |
 |---|---|
-| 日志里一直没有 `clipboard set` | 截图文件名不匹配 `Screenshot*`。看自检输出的 "files that are there"，然后加参数 `-Filter '你的命名*'` |
+| 日志里一直没有 `clipboard set` | 截图文件名不匹配任何 `-Filter` 模式。看自检输出的 "files that are there"，然后加参数，例如 `-Filter '你的命名*'`；要全收就 `-Filter '*'` |
 | 日志有 `clipboard set`，但远程粘不出来 | Windows 侧没问题，问题在 xrdp 的文件剪贴板通路（见下文） |
 | 日志频繁出现 `reconciliation scan picked up` | FileSystemWatcher 在这台机器上不可靠，加 `-Mode Poll` 切回轮询 |
 
@@ -121,13 +121,13 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
 ## 可调参数
 
 ```powershell
-.\winshot2clip.ps1 -WatchDir "D:\somewhere" -Filter "截图*" -ReconcileSeconds 0
+.\winshot2clip.ps1 -WatchDir "D:\somewhere" -Filter '截图*' -ReconcileSeconds 0
 ```
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `-WatchDir` | `%USERPROFILE%\Pictures\Screenshots` | 监听目录，中文路径也可以 |
-| `-Filter` | `Screenshot*` | 文件名通配符 |
+| `-Filter` | `Screenshot*` 与中文 Windows 的 `屏幕截图*` | **一个或多个**文件名通配符（数组）。Windows 按系统语言命名截图，英文安装写 `Screenshot 2026-01-01 120000.png`，中文安装写 `屏幕截图 2026-01-01 120000.png`，所以默认给两个。要全收就传 `'*'`；多个模式就传数组 |
 | `-Mode` | `Watch` | `Watch` = 事件驱动；`Poll` = 定时扫描目录（逃生开关） |
 | `-ReconcileSeconds` | `60` | Watch 模式下，空等这么久没有事件就扫一次目录兜底。`0` = 关掉周期性兜底，只保留 Error 驱动的恢复 |
 | `-SettleTimeoutMs` | `5000` | 等文件停止增长的上限 |
@@ -157,6 +157,10 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
 
 **为什么启动时把已有文件标记为"已处理"。** 否则刚开机就会把一张旧截图塞进你的剪贴板，覆盖掉你当时正在用的内容。
 
+**为什么 `-Filter` 是数组，且默认值里那个中文前缀写成码点。** Windows 的截图文件名是**按系统语言**生成的：英文安装写 `Screenshot ...`，中文安装写 `屏幕截图 ...`。单个英文通配符在中文系统上匹配不到任何东西，而且症状是**静默无动作**（进程在跑、日志干净、什么也不复制），看起来像工具坏了。所以默认给两个模式，`-Filter` 也支持数组。
+
+前级不能写成字面量：本文件必须保持纯 ASCII（否则 Windows PowerShell 5.1 会按系统 ANSI 代码页解码，中文字面量变乱码），所以用 `[char]0x5C4F` 这类码点拼出来。测试里有一条专门把这个值钉死在四个具体码点上，防止有人“顺手”改成字面量。
+
 **去重按"文件版本"而不是按"路径"。** `$seen` 存的是 `路径 → (长度+mtime)`，而不是一堆路径。所以：截图工具**覆写同名文件**（固定文件名、或者旧式的 `Screenshot (1).png` 复用编号）时，新内容照样会被复制；而同一个文件因为重复事件被看多次时，不会反复刷剪贴板。签名只在 `Get-FileSignature` 一处构造，两边比对不可能对不上。
 
 ## 平台行为探测记录（在 Linux/inotify 上做的，Windows 待验证）
@@ -181,11 +185,13 @@ SourceEventArgs = System.IO.FileSystemEventArgs  ← 正确读取位置
 
 **3. `NotifyFilter = FileName` 不会报告目录创建事件。**（这条与平台无关，可以直接信：`FileName` 映射到 `FILE_NOTIFY_CHANGE_FILE_NAME`，只覆盖文件，目录要 `DirectoryName`）所以新子目录根本不会产生事件 —— 而且这样更好：内核缓冲区不用为无关事件占位。代码里对目录的防御（`Test-Path -PathType Leaf`）是第二道保险，测试用合成事件单独验证过它有效。
 
+**4. 截图文件名是按系统语言本地化的。**（这条是**实测**，就是在中文 Windows 上发现的：中文安装写 `屏幕截图 2026-09-22 224547.png`）同理，任何依赖英文前缀的假设都是错的。
+
 ## 已验证 / 待验证
 
 我在 NixOS 上，**没有 Windows 环境**，所以边界说清楚。
 
-**已实测（140 项断言，连跑三遍全绿、退出码 0，`tests/logic-tests.ps1`）**
+**已实测（152 项断言，连跑三遍全绿、退出码 0，`tests/logic-tests.ps1`）**
 
 其中约 60 项是审计之后补的回归断言，每一条锁一个具体缺陷。测试 harness 现在从生产源码里读配置值（`$script:Extensions` / `MaxAttempts` / `EventSource`），所以改生产配置会真的让测试跟着变——而不是继续默默地测旧值。
 

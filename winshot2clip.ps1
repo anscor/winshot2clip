@@ -61,8 +61,20 @@ param(
     # Folder the screenshot tool saves into.
     [string] $WatchDir = (Join-Path $env:USERPROFILE 'Pictures\Screenshots'),
 
-    # Filename wildcard. Only files matching this are considered.
-    [string] $Filter = 'Screenshot*',
+    # One or more filename wildcards. An array, because Windows names
+    # screenshots in the system language: an English install writes
+    # "Screenshot 2026-01-01 120000.png" while a Chinese one writes the same
+    # suffix behind a localised prefix. A single English-only pattern matches
+    # nothing there, which is silent and looks like the tool being broken.
+    #
+    # The localised prefix is spelled as code points on purpose: this file has
+    # to stay pure ASCII, or Windows PowerShell 5.1 decodes it with the system
+    # ANSI code page and turns any literal into mojibake (see the header).
+    # Four characters: the Chinese word for "screen shot".
+    [string[]] $Filter = @(
+        'Screenshot*',
+        ((-join @([char]0x5C4F, [char]0x5E55, [char]0x622A, [char]0x56FE)) + '*')
+    ),
 
     # Watch = event driven (recommended). Poll = scan the directory on a
     # timer, the escape hatch if FileSystemWatcher misbehaves on a machine.
@@ -142,15 +154,36 @@ function Write-Log {
 
 # ------------------------------------------------------------- eligibility --
 
+function Test-NameMatchesPattern {
+    <#
+        True when the file name matches any of the configured wildcards.
+
+        Matching lives here, not in Get-ChildItem -Filter, because -Filter
+        takes a single wildcard and hands it to the filesystem provider -- one
+        more place for a localised name to go wrong. -like works on .NET
+        strings and handles as many patterns as we like.
+    #>
+    param([string] $Name, [string[]] $Pattern)
+
+    if ([string]::IsNullOrEmpty($Name)) { return $false }
+
+    foreach ($candidate in $Pattern) {
+        if ([string]::IsNullOrEmpty($candidate)) { continue }
+        if ($Name -like $candidate) { return $true }
+    }
+    return $false
+}
+
 function Test-ScreenshotPath {
     <#
         True when this path is something we should act on: a real file,
-        whose name matches the wildcard, with a whitelisted extension.
+        whose name matches one of the wildcards, with a whitelisted
+        extension.
 
         Test-Path -PathType Leaf matters because a Created event is also
         raised for new subdirectories.
     #>
-    param([string] $Path, [string] $Pattern)
+    param([string] $Path, [string[]] $Pattern)
 
     if ([string]::IsNullOrEmpty($Path)) { return $false }
 
@@ -158,17 +191,20 @@ function Test-ScreenshotPath {
     if ([string]::IsNullOrEmpty($extension)) { return $false }
     if (-not ($script:Extensions -contains $extension.ToLowerInvariant())) { return $false }
 
-    if (-not ([System.IO.Path]::GetFileName($Path) -like $Pattern)) { return $false }
+    if (-not (Test-NameMatchesPattern -Name ([System.IO.Path]::GetFileName($Path)) -Pattern $Pattern)) { return $false }
 
     return (Test-Path -LiteralPath $Path -PathType Leaf)
 }
 
 function Get-ScreenshotListing {
-    param([string] $Dir, [string] $Pattern)
+    param([string] $Dir, [string[]] $Pattern)
 
     try {
-        return @(Get-ChildItem -LiteralPath $Dir -Filter $Pattern -File -ErrorAction Stop |
-                 Where-Object { $script:Extensions -contains $_.Extension.ToLowerInvariant() })
+        return @(Get-ChildItem -LiteralPath $Dir -File -ErrorAction Stop |
+                 Where-Object {
+                     $script:Extensions -contains $_.Extension.ToLowerInvariant() -and
+                     (Test-NameMatchesPattern -Name $_.Name -Pattern $Pattern)
+                 })
     }
     catch {
         Write-Log "scan failed: $($_.Exception.Message)"
@@ -215,7 +251,7 @@ function New-SeenSet {
         launching the watcher never dumps a month-old screenshot over
         whatever you currently have on the clipboard.
     #>
-    param([string] $Dir, [string] $Pattern)
+    param([string] $Dir, [string[]] $Pattern)
 
     # A plain hashtable: PowerShell compares its string keys
     # case-insensitively, which is what Windows paths need.
@@ -312,7 +348,7 @@ function Copy-ScreenshotFile {
     #>
     param(
         [Parameter(Mandatory = $true)][string] $Path,
-        [Parameter(Mandatory = $true)][string] $Pattern,
+        [Parameter(Mandatory = $true)][string[]] $Pattern,
         [Parameter(Mandatory = $true)][hashtable] $Seen,
         [Parameter(Mandatory = $true)][hashtable] $Pending,
         [int] $SettleTimeoutMs = 5000,
@@ -374,7 +410,7 @@ function Copy-ScreenshotFile {
 
 function Invoke-RetryPending {
     param(
-        [Parameter(Mandatory = $true)][string] $Pattern,
+        [Parameter(Mandatory = $true)][string[]] $Pattern,
         [Parameter(Mandatory = $true)][hashtable] $Seen,
         [Parameter(Mandatory = $true)][hashtable] $Pending,
         [int] $SettleTimeoutMs = 5000
@@ -414,7 +450,7 @@ function Invoke-ScanPass {
     #>
     param(
         [Parameter(Mandatory = $true)][string] $Dir,
-        [Parameter(Mandatory = $true)][string] $Pattern,
+        [Parameter(Mandatory = $true)][string[]] $Pattern,
         [Parameter(Mandatory = $true)][hashtable] $Seen,
         [Parameter(Mandatory = $true)][hashtable] $Pending,
         [int] $SettleTimeoutMs = 5000,
@@ -436,13 +472,15 @@ function Invoke-ScanPass {
 function New-ScreenshotWatcher {
     param(
         [Parameter(Mandatory = $true)][string] $Dir,
-        [Parameter(Mandatory = $true)][string] $Pattern,
         [Parameter(Mandatory = $true)][string] $EventSource
     )
 
     $watcher = New-Object System.IO.FileSystemWatcher
     $watcher.Path = $Dir
-    $watcher.Filter = $Pattern
+    # '*' and not the name patterns: FileSystemWatcher.Filter takes a single
+    # wildcard, and name matching is Test-ScreenshotPath's job anyway. The
+    # folder only holds screenshots, so the extra events cost nothing.
+    $watcher.Filter = '*'
     # FileName is all we need -- creation, deletion and renames. Leaving
     # Size and LastWrite out keeps the kernel's change buffer from filling
     # up with writes we do not care about, which is what makes an overflow
@@ -481,7 +519,7 @@ function Invoke-EventCycle {
                      caller must run a full scan.
     #>
     param(
-        [Parameter(Mandatory = $true)][string] $Pattern,
+        [Parameter(Mandatory = $true)][string[]] $Pattern,
         [Parameter(Mandatory = $true)][hashtable] $Seen,
         [Parameter(Mandatory = $true)][hashtable] $Pending,
         [int] $TimeoutSeconds = 60,
@@ -537,7 +575,7 @@ function Invoke-WatchIteration {
     #>
     param(
         [Parameter(Mandatory = $true)][string] $Dir,
-        [Parameter(Mandatory = $true)][string] $Pattern,
+        [Parameter(Mandatory = $true)][string[]] $Pattern,
         [Parameter(Mandatory = $true)][hashtable] $Seen,
         [Parameter(Mandatory = $true)][hashtable] $Pending,
         [int] $ReconcileSeconds = 60,
@@ -595,7 +633,7 @@ function Invoke-WatchIteration {
 
 function Start-WatchLoop {
     param(
-        [string] $Dir, [string] $Pattern, [hashtable] $Seen, [hashtable] $Pending,
+        [string] $Dir, [string[]] $Pattern, [hashtable] $Seen, [hashtable] $Pending,
         [int] $ReconcileSeconds = 60, [int] $EventTimeoutSeconds = 0, [int] $SettleTimeoutMs = 5000
     )
 
@@ -607,7 +645,7 @@ function Start-WatchLoop {
         Write-Log 'WARNING: not running in an STA apartment; clipboard calls may fail. Start with -STA.'
     }
 
-    $watcher = New-ScreenshotWatcher -Dir $Dir -Pattern $Pattern -EventSource $script:EventSource
+    $watcher = New-ScreenshotWatcher -Dir $Dir -EventSource $script:EventSource
 
     $backstop = 'off'
     if ($ReconcileSeconds -gt 0) { $backstop = "${ReconcileSeconds}s" }
@@ -645,7 +683,7 @@ function Start-WatchLoop {
 
 function Start-PollLoop {
     param(
-        [string] $Dir, [string] $Pattern, [hashtable] $Seen, [hashtable] $Pending,
+        [string] $Dir, [string[]] $Pattern, [hashtable] $Seen, [hashtable] $Pending,
         [int] $PollMs = 400, [int] $SettleTimeoutMs = 5000
     )
 
@@ -681,12 +719,31 @@ function Get-ProbeName {
         Builds a filename that satisfies the configured -Filter.
 
         The self test has to hand both the watcher and the scan something the
-        user's own filter accepts. A hardcoded "Screenshot selftest ..." name
-        only works for one filter, which made every other filter reject its own
-        probe and report FAIL for a perfectly good configuration.
+        user's own filter accepts; a hardcoded name only works for one filter,
+        which made every other filter reject its own probe and report FAIL for
+        a perfectly good configuration.
 
-        Returns $null when no synthesised name can satisfy the filter. The
-        caller reports that as INCONCLUSIVE, not as a failure.
+        Returns $null when no synthesised name can satisfy any of the patterns.
+        The caller reports that as INCONCLUSIVE, not as a failure.
+    #>
+    param([string[]] $Pattern, [string] $Stamp, [string] $Kind)
+
+    if ($null -eq $Pattern -or $Pattern.Count -eq 0) { return $null }
+
+    # Any one of the configured patterns will do: the probe only has to be
+    # eligible. The first pattern that yields a usable name wins, which for the
+    # default list keeps the probe pure ASCII.
+    foreach ($single in $Pattern) {
+        $name = Get-ProbeNameForPattern -Pattern $single -Stamp $Stamp -Kind $Kind
+        if ($null -ne $name) { return $name }
+    }
+    return $null
+}
+
+function Get-ProbeNameForPattern {
+    <#
+        One pattern, one name. Returns $null when this particular pattern
+        cannot be satisfied by anything we are able to synthesise.
     #>
     param([string] $Pattern, [string] $Stamp, [string] $Kind)
 
@@ -733,7 +790,7 @@ function Get-WatchDirDiagnostic {
         purpose: they need different fixes, and conflating them told users to
         change -Filter when the real problem was the file format.
     #>
-    param([string] $Dir, [string] $Pattern)
+    param([string] $Dir, [string[]] $Pattern)
 
     $lines = New-Object System.Collections.ArrayList
 
@@ -745,7 +802,8 @@ function Get-WatchDirDiagnostic {
 
     $byName = @()
     try {
-        $byName = @(Get-ChildItem -LiteralPath $Dir -Filter $Pattern -File -ErrorAction Stop)
+        $byName = @(Get-ChildItem -LiteralPath $Dir -File -ErrorAction Stop |
+                    Where-Object { Test-NameMatchesPattern -Name $_.Name -Pattern $Pattern })
     }
     catch {
         [void] $lines.Add("WARN: cannot list the watch directory: $($_.Exception.Message)")
@@ -790,7 +848,7 @@ function Get-WatchDirDiagnostic {
 
 function Invoke-SelfTest {
     param(
-        [string] $Dir, [string] $Pattern, [int] $SettleTimeoutMs = 5000, [int] $EventTimeoutSeconds = 5
+        [string] $Dir, [string[]] $Pattern, [int] $SettleTimeoutMs = 5000, [int] $EventTimeoutSeconds = 5
     )
 
     Write-Log '=== SelfTest start ==='
@@ -830,8 +888,9 @@ function Invoke-SelfTest {
 
     $probeScanName  = Get-ProbeName -Pattern $Pattern -Stamp $stamp -Kind 'scan'
     $probeEventName = Get-ProbeName -Pattern $Pattern -Stamp $stamp -Kind 'event'
-    if (($probeScanName -notlike $Pattern) -or ($probeEventName -notlike $Pattern)) {
-        Write-Log ("WARN: cannot synthesise a filename that matches '$Pattern'; skipping the copy probes.")
+    if ((-not (Test-NameMatchesPattern -Name $probeScanName -Pattern $Pattern)) -or
+        (-not (Test-NameMatchesPattern -Name $probeEventName -Pattern $Pattern))) {
+        Write-Log ("WARN: cannot synthesise a filename that matches '{0}'; skipping the copy probes." -f ($Pattern -join "', '"))
         Write-Log 'WARN: the directory and apartment checks above are still valid, but the clipboard round trip was NOT exercised.'
         Write-Log '=== SelfTest result: INCONCLUSIVE ==='
         Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -876,7 +935,7 @@ function Invoke-SelfTest {
         #         the event queue drive it. This is the part that cannot be
         #         tested anywhere except on the target machine. ---
         $probeEventSource = 'WinShot2ClipSelfTest'
-        $watcher = New-ScreenshotWatcher -Dir $probeDir -Pattern $Pattern -EventSource $probeEventSource
+        $watcher = New-ScreenshotWatcher -Dir $probeDir -EventSource $probeEventSource
         Write-Log 'OK: FileSystemWatcher armed (Created / Renamed / Error)'
 
         try {
