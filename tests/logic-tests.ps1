@@ -904,25 +904,28 @@ Assert 'and released from a finally block, so an exception cannot leak them' `
 # Reading the clipboard with a tight loop fights the RDP client, which is also
 # reading it at that moment and holds it open while it does. Let it go quiet
 # first, and do the read-back at a human pace.
-$settleCall = @($funcAst['Set-ClipboardForScreenshot'].FindAll({
+# A fixed "wait for the clipboard to go quiet" step existed here once and was
+# removed: it burned its entire ceiling on the healthy path (measured ~1750ms),
+# because it waited to be told the clipboard was free even when it already was.
+# The read-back loop now does both jobs. Assert the fixed wait is gone, and that
+# the loop is still bounded and backs off.
+$allCalls = @($funcAst['Set-ClipboardForScreenshot'].FindAll({
     param($n) $n -is [System.Management.Automation.Language.CommandAst]
 }, $true))
-$settleIdx = -1
-$verifyIdx = -1
-for ($i = 0; $i -lt $settleCall.Count; $i++) {
-    $name = $settleCall[$i].GetCommandName()
-    if ($name -eq 'Wait-ClipboardToSettle' -and $settleIdx -lt 0) { $settleIdx = $i }
-    if ($name -eq 'Test-ClipboardHoldsFile' -and $verifyIdx -lt 0) { $verifyIdx = $i }
-}
-Assert 'Shell mode waits for the clipboard to settle before reading it back' ($settleIdx -ge 0)
-Assert 'and it settles BEFORE the read-back, not after' `
-       ($settleIdx -ge 0 -and $verifyIdx -ge 0 -and $settleIdx -lt $verifyIdx) `
-       "settle at $settleIdx, read-back at $verifyIdx"
+Assert 'no separate fixed settle wait remains in Shell mode' `
+       (@($allCalls | Where-Object { $_.GetCommandName() -eq 'Wait-ClipboardToSettle' }).Count -eq 0)
+Assert 'the read-back itself is what runs after the shell copy' `
+       (@($allCalls | Where-Object { $_.GetCommandName() -eq 'Test-ClipboardHoldsFile' }).Count -eq 1)
 
-$settleBody = $funcAst['Wait-ClipboardToSettle'].Extent.Text
-Assert 'the settle wait is bounded' ($settleBody -match 'MaxMilliseconds')
-Assert 'the read-back polls at a human pace, not every 100ms' `
-       ($holdsBody -match 'Start-Sleep -Milliseconds 500')
+$holdsBody = $funcAst['Test-ClipboardHoldsFile'].Extent.Text
+Assert 'the read-back loop is bounded' ($holdsBody -match 'AddSeconds')
+Assert 'it sleeps between attempts (it does not spin)' ($holdsBody -match 'Start-Sleep')
+Assert 'and it backs off instead of hammering the clipboard' ($holdsBody -match '\$delay \+=')
+Assert 'the back-off is capped' ($holdsBody -match '\$delay -lt 250')
+
+# What made it slow: a loop that only exits when the clipboard looks busy.
+Assert 'the wait no longer requires the clipboard to become busy' `
+       ($holdsBody -notmatch 'GetDataObject')
 
 Section 'clipboard mode dispatch'
 

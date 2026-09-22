@@ -462,59 +462,51 @@ function Set-ClipboardFileByShellVerb {
     }
 }
 
-function Wait-ClipboardToSettle {
-    <#
-        Give the clipboard a moment to go quiet before reading it.
-
-        A screenshot lands on the clipboard while the RDP client is also looking
-        at it, and the client holds the clipboard open while it does. Reading it
-        continuously through that window is how we end up fighting the client
-        for it -- which shows up as a copy that appears to fail and then
-        succeeds on the retry. So: wait until an open fails (meaning someone,
-        probably the client, has it), then wait a little longer.
-    #>
-    param([int] $MaxMilliseconds = 1500, [int] $StepMilliseconds = 50)
-
-    $deadline = (Get-Date).AddMilliseconds($MaxMilliseconds)
-    while ((Get-Date) -lt $deadline) {
-        try {
-            $null = [System.Windows.Forms.Clipboard]::GetDataObject()
-        }
-        catch {
-            # Someone else had it; that is the signal we were waiting for.
-            break
-        }
-        Start-Sleep -Milliseconds $StepMilliseconds
-    }
-
-    # Even when it never looked busy, do not read it again immediately.
-    Start-Sleep -Milliseconds 200
-}
-
 function Test-ClipboardHoldsFile {
     <#
-        True when the file is already on the clipboard as a file drop.
+        Waits for the file to appear on the clipboard, and reports whether it
+        did.
 
-        Polled rather than assumed: InvokeVerb posts to explorer's message loop
-        and returns before the copy has happened.
+        One bounded loop doing two jobs at once:
 
-        Deliberately modest: a handful of attempts with a few hundred
-        milliseconds between them. A shell copy of a local file is fast, and a
-        tighter loop would mean reading the clipboard while the RDP client is
-        reading it too.
+          * read-back, because InvokeVerb only posts a message to explorer's
+            message loop -- it returns before the copy has happened; and
+          * backing off, because the RDP client reads the clipboard at the same
+            moment and holds it open while it does. A read that throws means
+            someone else has it (the client, mid-transfer), which is a reason
+            to wait, not a failure.
+
+        Combining them is what makes the common case fast. An earlier version
+        probed for "is the clipboard busy" in a separate loop first, with a
+        fixed ceiling: if nobody ever contended for it -- the fast, healthy
+        path -- that probe still burned its entire ceiling before doing
+        anything. Here the first read is also the first check, so a quiet
+        clipboard finishes on the first pass instead of waiting to be told it
+        was quiet.
     #>
     param(
         [Parameter(Mandatory = $true)][string] $Path,
-        [int] $TimeoutSeconds = 5
+        [int] $TimeoutSeconds = 5,
+        [int] $StepMilliseconds = 50
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $delay = $StepMilliseconds
+
     while ($true) {
+        # GetClipboardFileList already swallows a locked clipboard and returns
+        # nothing, which is exactly how a busy clipboard should read here.
         foreach ($entry in @(Get-ClipboardFileList)) {
             if ($entry -eq $Path) { return $true }
         }
         if ((Get-Date) -ge $deadline) { return $false }
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds $delay
+
+        # Back off. A quiet clipboard is confirmed in one or two reads, but a
+        # copy that never lands must not turn into a tight read loop -- every
+        # read is a chance to collide with the client, which is reading the
+        # same clipboard at the same time.
+        if ($delay -lt 250) { $delay += 50 }
     }
 }
 
@@ -533,9 +525,9 @@ function Set-ClipboardForScreenshot {
     switch ($Mode) {
         'Shell' {
             Set-ClipboardFileByShellVerb -Path $Path
-            # Let the client finish whatever it is doing with the clipboard
-            # before we read it back.
-            Wait-ClipboardToSettle
+            # No separate settle wait: the loop below is both the read-back and
+            # the back-off. A locked clipboard reads as "not there yet", which
+            # is the right thing to do about it.
             if (-not (Test-ClipboardHoldsFile -Path $Path)) {
                 throw "the shell did not put $Path on the clipboard"
             }
