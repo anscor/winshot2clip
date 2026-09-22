@@ -14,7 +14,7 @@ xrdp 的 `cliprdr` 通道只实现了**文本**和**文件列表**两种剪贴�
 |---|---|
 | `winshot2clip.ps1` | 主程序：监听目录 + 把新截图放进剪贴板 + 写日志 |
 | `start-hidden.vbs` | 无窗口启动器（避免每次登录黑窗口一闪） |
-| `tests/logic-tests.ps1` | 逻辑回归测试（152 项断言，不依赖 Windows，任意平台的 pwsh 都能跑） |
+| `tests/logic-tests.ps1` | 逻辑回归测试（169 项断言，不依赖 Windows，任意平台的 pwsh 都能跑） |
 
 两个脚本都是**纯 ASCII**，这是刻意的：Windows PowerShell 5.1 在没有 UTF-8 BOM 时按系统 ANSI 代码页解析 `.ps1`，非 ASCII 字符会变乱码。纯 ASCII 意味着**你用任何方式传输都不会出问题，包括直接从 RDP 剪贴板粘贴到记事本另存**。中文路径照样能用（命令行参数是 UTF-16）。
 
@@ -133,6 +133,7 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
 | `-SettleTimeoutMs` | `5000` | 等文件停止增长的上限 |
 | `-PollMs` | `400` | 仅 `-Mode Poll`：扫描间隔 |
 | `-EventTimeoutSeconds` | `0` | 仅 `-Mode Watch`：覆盖单轮等待时长。主要为测试暴露，平时不用动。**注意**：兜底扫描就是由"某一轮没等到任何事件"触发的，所以调小它等于同时把兜底扫描的间隔也调小（它会覆盖 `-ReconcileSeconds`）|
+| `-KeepOriginalName` | 关（即默认做 ASCII 副本） | 把截图**原路径**放上剪贴板，而不是 `%TEMP%` 里的 ASCII 副本。默认关闭的原因见下文那个 xrdp 解析器 bug |
 | `-LogPath` | `%USERPROFILE%\winshot2clip.log` | 日志路径 |
 | `-Once <路径>` | — | 一次性模式：把指定文件放进剪贴板后退出 |
 | `-SelfTest` | — | 自检模式 |
@@ -163,6 +164,18 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
 
 **去重按"文件版本"而不是按"路径"。** `$seen` 存的是 `路径 → (长度+mtime)`，而不是一堆路径。所以：截图工具**覆写同名文件**（固定文件名、或者旧式的 `Screenshot (1).png` 复用编号）时，新内容照样会被复制；而同一个文件因为重复事件被看多次时，不会反复刷剪贴板。签名只在 `Get-FileSignature` 一处构造，两边比对不可能对不上。
 
+**为什么默认要先把截图复制成 ASCII 文件名的副本再放上剪贴板。**
+
+这是本项目目前最重要的一个约束，因为它决定了"能不能粘贴"。xrdp 解析剪贴板文件列表的代码用 `wcstombs()` 的返回值计算要跳过多少字节，**对 ASCII 文件名正确，对非 ASCII 文件名算得太短**（上游 issue #1992，同一区域后来还在 PR #1996 里补了缓冲区越界检查）。后果是：一个文件列表里**只有第一个文件描述符被正确读出**，而且剪贴板通道会被拖死——表现为"**第一张图能粘，之后就都不行了，连文字也一起死**"，且断开重连才能恢复。
+
+Windows 的截图文件名是**按系统语言**生成的，所以中文安装上每一张截图的名字都是非 ASCII，每一张都会命中那个解析器。因此：
+
+1. 截图被发现后，先 `Copy-Item` 到 `%TEMP%\winshot2clip\shot-<时间戳>-<序号>.png`
+2. 把**这个副本**的路径放上剪贴板
+3. 副本目录只保留最新 20 个
+
+内容按字节完全相同，所以下游除名字外无法分辨。`-KeepOriginalName` 可以关掉这个行为，但除非你确定自己的截图是纯英文名、或者已升级到修好的 xrdp，否则不要关。
+
 ## 平台行为探测记录（在 Linux/inotify 上做的，Windows 待验证）
 
 下面这三条是我写代码前后**实际探测**出来的（不是文档抄来的），但探测环境是 **Linux 的 inotify**——我手上没有 Windows。`ReadDirectoryChangesW` 的投递语义、缓冲区溢出行为、名子配对规则都可能不同，所以这三条在 Windows 上都要重新确认。第 3 条与平台无关，可以直接信。
@@ -185,13 +198,13 @@ SourceEventArgs = System.IO.FileSystemEventArgs  ← 正确读取位置
 
 **3. `NotifyFilter = FileName` 不会报告目录创建事件。**（这条与平台无关，可以直接信：`FileName` 映射到 `FILE_NOTIFY_CHANGE_FILE_NAME`，只覆盖文件，目录要 `DirectoryName`）所以新子目录根本不会产生事件 —— 而且这样更好：内核缓冲区不用为无关事件占位。代码里对目录的防御（`Test-Path -PathType Leaf`）是第二道保险，测试用合成事件单独验证过它有效。
 
-**4. 截图文件名是按系统语言本地化的。**（这条是**实测**，就是在中文 Windows 上发现的：中文安装写 `屏幕截图 2026-09-22 224547.png`）同理，任何依赖英文前缀的假设都是错的。
+**4. 截图文件名是按系统语言本地化的。**（这条是**实测**，就是在中文 Windows 上发现的：中文安装写 `屏幕截图 2026-09-22 224547.png`）同理，任何依赖英文前缀的假设都是错的。而且**非 ASCII 名字会触发上游 xrdp 的解析器 bug**（issue #1992），见上文“为什么默认要先把截图复制成 ASCII 文件名的副本”。
 
 ## 已验证 / 待验证
 
 我在 NixOS 上，**没有 Windows 环境**，所以边界说清楚。
 
-**已实测（152 项断言，连跑三遍全绿、退出码 0，`tests/logic-tests.ps1`）**
+**已实测（169 项断言，连跑三遍全绿、退出码 0，`tests/logic-tests.ps1`）**
 
 其中约 60 项是审计之后补的回归断言，每一条锁一个具体缺陷。测试 harness 现在从生产源码里读配置值（`$script:Extensions` / `MaxAttempts` / `EventSource`），所以改生产配置会真的让测试跟着变——而不是继续默默地测旧值。
 

@@ -157,13 +157,26 @@ Assert 'production -Filter default was read from the param block' ($prodFilter.C
 
 $prodExtensionList = ($prodExtensions | ForEach-Object { "'$_'" }) -join ', '
 
+# The state-machine tests below inject failures and compare clipboard contents by
+# path, so they need the screenshot's own path to be the one that reaches the
+# clipboard. The ASCII-copy workaround (the production default) has its own
+# section, which switches this off and asserts the real names.
+$prodKeepOriginalParam = $null
+if ($null -ne $ast.ParamBlock) {
+    $prodKeepOriginalParam = @($ast.ParamBlock.Parameters |
+                              Where-Object { $_.Name.VariablePath.UserPath -eq 'KeepOriginalName' })[0]
+}
+
 # The preamble goes into the same scriptblock as the definitions, so whatever
 # $script: resolves to, the functions and these values agree.
 $preamble = @"
-`$script:LogFile     = '$($global:TestRoot -replace '\\', '/')/run.log'
-`$script:Extensions  = @($prodExtensionList)
-`$script:MaxAttempts = $prodMaxAttempts
-`$script:EventSource = '$prodEventSource'
+`$script:LogFile          = '$($global:TestRoot -replace '\\', '/')/run.log'
+`$script:Extensions       = @($prodExtensionList)
+`$script:MaxAttempts      = $prodMaxAttempts
+`$script:EventSource      = '$prodEventSource'
+`$script:KeepOriginalName = `$true
+`$script:ClipSerial       = 0
+`$script:LastClipboardPath = `$null
 "@
 
 . ([scriptblock]::Create($preamble + "`n" + ($functions -join "`n`n")))
@@ -829,6 +842,94 @@ Assert 'the directory diagnostic reports it as a match' `
 Assert 'and -SelfTest can build both probes for the default filter' `
        ($null -ne (Get-ProbeName -Pattern $prodFilter -Stamp '20260922-224547' -Kind 'scan') -and
         $null -ne (Get-ProbeName -Pattern $prodFilter -Stamp '20260922-224547' -Kind 'event'))
+
+Section 'the ASCII-copy workaround is the production default'
+
+Assert 'production declares -KeepOriginalName' ($null -ne $prodKeepOriginalParam)
+Assert 'and it is a switch' `
+       ($null -ne $prodKeepOriginalParam -and $prodKeepOriginalParam.StaticType.Name -eq 'SwitchParameter') `
+       "got $($prodKeepOriginalParam.StaticType.Name)"
+Assert 'with no default, so the ASCII copy is used unless asked otherwise' `
+       ($null -ne $prodKeepOriginalParam -and $null -eq $prodKeepOriginalParam.DefaultValue)
+
+Section 'xrdp file-list parser workaround (ASCII name on the clipboard)'
+
+# Upstream xrdp issue #1992: the CLIPRDR_FILEDESCRIPTOR parser derives its skip
+# length from wcstombs(), which is wrong for non-ASCII names, so only the first
+# file in a list is read and the clipboard channel ends up wedged. Windows names
+# screenshots in the system language, so a Chinese install always hits it.
+# The workaround is to put an ASCII-named copy on the clipboard instead.
+$localisedPrefix2 = -join @([char]0x5C4F, [char]0x5E55, [char]0x622A, [char]0x56FE)
+$dirAscii = New-TestDir 'ascii-copy'
+$cnShot   = Join-Path $dirAscii ('{0} 2026-09-22 224547.png' -f $localisedPrefix2)
+[IO.File]::WriteAllBytes($cnShot, [Convert]::FromBase64String($ProbePng))
+
+$script:KeepOriginalName = $false
+$copied = Copy-ForClipboard -Path $cnShot
+
+Assert 'an ASCII copy is produced' (-not [string]::IsNullOrEmpty($copied))
+Assert 'the copy has a pure ASCII name' `
+       (@($copied.ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count -eq 0) "got '$copied'"
+Assert 'the copy keeps the extension' `
+       ([System.IO.Path]::GetExtension($copied) -eq '.png') "got '$([System.IO.Path]::GetExtension($copied))'"
+Assert 'the copy exists' (Test-Path -LiteralPath $copied -PathType Leaf)
+Assert 'the copy is byte-identical to the screenshot' `
+       ((Get-Item -LiteralPath $copied).Length -eq (Get-Item -LiteralPath $cnShot).Length)
+
+Assert 'two screenshots do not collide on the same ASCII name' `
+       ((Copy-ForClipboard -Path $cnShot) -ne $copied)
+
+$kept = @(Get-ChildItem -LiteralPath (Split-Path -Parent $copied) -File -ErrorAction SilentlyContinue).Count
+Assert 'the temp directory is bounded (it does not grow without limit)' ($kept -le 25) "$kept file(s)"
+
+# The real end-to-end shape: a Chinese-named screenshot goes in, and what lands
+# on the clipboard is an existing ASCII-named file with the same bytes.
+$dirE2E = New-TestDir 'ascii-e2e'
+$e2eShot = Join-Path $dirE2E ('{0} 2026-09-22 230000.png' -f $localisedPrefix2)
+[IO.File]::WriteAllBytes($e2eShot, [Convert]::FromBase64String($ProbePng))
+$seenE2E = @{}
+$pendingE2E = @{}
+$global:Calls.Clear()
+$null = Copy-ScreenshotFile -Path $e2eShot -Pattern $prodFilter -Seen $seenE2E -Pending $pendingE2E -SettleTimeoutMs 3000
+Assert 'end to end: one path reaches the clipboard' ($global:Calls.Count -eq 1) "got $($global:Calls.Count)"
+Assert 'end to end: it is ASCII' `
+       ($global:Calls.Count -eq 1 -and @($global:Calls[0].ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count -eq 0) `
+       "got '$($global:Calls -join '; ')'"
+Assert 'end to end: it exists and matches the screenshot byte count' `
+       ($global:Calls.Count -eq 1 -and
+        (Test-Path -LiteralPath $global:Calls[0] -PathType Leaf) -and
+        ((Get-Item -LiteralPath $global:Calls[0]).Length -eq (Get-Item -LiteralPath $e2eShot).Length))
+Assert 'end to end: the screenshot itself is what is remembered as seen' ($seenE2E.ContainsKey($e2eShot))
+
+# The switch must actually restore the old behaviour.
+$script:KeepOriginalName = $true
+$dirKeep = New-TestDir 'keep-original'
+$keepShot = Join-Path $dirKeep ('{0} keep.png' -f $localisedPrefix2)
+[IO.File]::WriteAllBytes($keepShot, [Convert]::FromBase64String($ProbePng))
+$seenKeep = @{}
+$pendingKeep = @{}
+$global:Calls.Clear()
+$null = Copy-ScreenshotFile -Path $keepShot -Pattern $prodFilter -Seen $seenKeep -Pending $pendingKeep -SettleTimeoutMs 3000
+Assert '-KeepOriginalName puts the original path on the clipboard' `
+       ($global:Calls.Count -eq 1 -and $global:Calls[0] -eq $keepShot) "got '$($global:Calls -join '; ')'"
+
+# Back to the production default for the remaining assertions.
+$script:KeepOriginalName = $false
+
+# And by default a non-ASCII screenshot must NOT reach the clipboard by its own
+# name -- that is the whole point of the workaround.
+$dirDefault = New-TestDir 'default-ascii'
+$defShot = Join-Path $dirDefault ('{0} default.png' -f $localisedPrefix2)
+[IO.File]::WriteAllBytes($defShot, [Convert]::FromBase64String($ProbePng))
+$seenDef = @{}
+$pendingDef = @{}
+$global:Calls.Clear()
+$null = Copy-ScreenshotFile -Path $defShot -Pattern $prodFilter -Seen $seenDef -Pending $pendingDef -SettleTimeoutMs 3000
+Assert 'by default the non-ASCII path is NOT what goes on the clipboard' `
+       ($global:Calls.Count -eq 1 -and $global:Calls[0] -ne $defShot) "got '$($global:Calls -join '; ')'"
+Assert 'and what does go on is ASCII' `
+       ($global:Calls.Count -eq 1 -and @($global:Calls[0].ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count -eq 0) `
+       "got '$($global:Calls -join '; ')'"
 
 Section 'A16: the watcher is armed before the baseline is primed'
 

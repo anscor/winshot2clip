@@ -98,6 +98,18 @@ param(
 
     [string] $LogPath = (Join-Path $env:USERPROFILE 'winshot2clip.log'),
 
+    # xrdp parses the clipboard file list with a length derived from wcstombs(),
+    # which is wrong for names that are not plain ASCII. Upstream issue #1992:
+    # only the first file descriptor is read correctly and the clipboard channel
+    # ends up wedged -- the first paste works, everything after it is dead.
+    # Windows names screenshots in the system language, so on a Chinese install
+    # every screenshot has a non-ASCII name.
+    #
+    # So by default each screenshot is copied to an ASCII-named file under
+    # %TEMP% and THAT path is what goes on the clipboard. Use this switch to
+    # put the original path on the clipboard instead.
+    [switch] $KeepOriginalName,
+
     # Diagnostic mode: exercises the whole detect -> clipboard -> read-back
     # cycle against a throwaway folder under %TEMP%, for both -Mode Watch
     # and -Mode Poll, without touching your own screenshots.
@@ -113,6 +125,13 @@ $script:LogFile     = $LogPath
 $script:Extensions  = @('.png', '.jpg', '.jpeg')
 $script:MaxAttempts = 3
 $script:EventSource = 'WinShot2Clip'
+$script:KeepOriginalName = [bool] $KeepOriginalName
+$script:ClipSerial = 0
+
+# The path most recently handed to the clipboard. With the ASCII-copy workaround
+# this is a %TEMP% copy, not the screenshot itself, so the self test has to ask
+# for this rather than assume the probe path.
+$script:LastClipboardPath = $null
 
 # ---------------------------------------------------------------- logging ---
 
@@ -233,6 +252,47 @@ function Get-FileSignature {
     catch {
         return $null
     }
+}
+
+function Copy-ForClipboard {
+    <#
+        Copies the screenshot to an ASCII-named file under %TEMP% and returns
+        that path.
+
+        xrdp parses the clipboard file list with a length derived from
+        wcstombs(), which is wrong for names that are not plain ASCII: upstream
+        issue #1992, where only the first file descriptor inside a
+        CLIPRDR_FILELIST is read correctly and the channel ends up wedged.
+        Windows names screenshots using the system language, so on a Chinese
+        install every screenshot hits that parser with a non-ASCII name.
+
+        The copy is byte-identical, so nothing downstream can tell the
+        difference apart from the name.
+    #>
+    param([string] $Path)
+
+    $directory = Join-Path ([System.IO.Path]::GetTempPath()) 'winshot2clip'
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        [void] (New-Item -ItemType Directory -Path $directory -Force)
+    }
+
+    $script:ClipSerial++
+    $extension = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+    $name = 'shot-{0}-{1:d3}{2}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $script:ClipSerial, $extension
+    $target = Join-Path $directory $name
+
+    Copy-Item -LiteralPath $Path -Destination $target -Force
+
+    # Bound the directory. The copy just made is the newest entry, so an
+    # announced path can never be pruned out from under a pending paste.
+    $keep = 20
+    $existing = @(Get-ChildItem -LiteralPath $directory -File -ErrorAction SilentlyContinue |
+                  Sort-Object LastWriteTime -Descending)
+    if ($existing.Count -gt $keep) {
+        $existing | Select-Object -Skip $keep | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+
+    return $target
 }
 
 function Test-AlreadyCopied {
@@ -378,15 +438,31 @@ function Copy-ScreenshotFile {
     # clipboard, and the one $Seen has to remember.
     $signature = Get-FileSignature -Path $Path
 
+    # What actually goes on the clipboard. See -KeepOriginalName for why this is
+    # normally an ASCII copy rather than the screenshot itself.
+    $clipboardPath = $Path
+    if (-not $script:KeepOriginalName) {
+        try {
+            $clipboardPath = Copy-ForClipboard -Path $Path
+        }
+        catch {
+            Write-Log "WARN: cannot make an ASCII copy of $Path ($($_.Exception.Message)); sending the original name"
+            $clipboardPath = $Path
+        }
+    }
+
     try {
-        $attempts = Set-ClipboardFile -Path $Path
+        $attempts = Set-ClipboardFile -Path $clipboardPath
+        $script:LastClipboardPath = $clipboardPath
         $Seen[$Path] = $signature
         if ($Pending.ContainsKey($Path)) { $Pending.Remove($Path) }
-        if ($attempts -gt 1) {
-            Write-Log ("clipboard set ({0} attempts): {1}" -f $attempts, $Path)
+        $suffix = ''
+        if ($attempts -gt 1) { $suffix = " ({0} attempts)" -f $attempts }
+        if ($clipboardPath -ne $Path) {
+            Write-Log "clipboard set${suffix}: $clipboardPath  (ASCII copy of $Path)"
         }
         else {
-            Write-Log "clipboard set: $Path"
+            Write-Log "clipboard set${suffix}: $clipboardPath"
         }
         return $true
     }
@@ -875,7 +951,7 @@ function Invoke-SelfTest {
 
     # 2. Exercise the real detect -> clipboard -> read-back cycle in a
     #    throwaway folder, so the user's own screenshots are never touched.
-    $probeDir = Join-Path $env:TEMP 'winshot2clip-selftest'
+    $probeDir = Join-Path ([System.IO.Path]::GetTempPath()) 'winshot2clip-selftest'
     Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
     $null = New-Item -ItemType Directory -Path $probeDir -Force
 
@@ -913,12 +989,21 @@ function Invoke-SelfTest {
             $pass = $false
         }
 
+        # The clipboard holds whatever Copy-ScreenshotFile decided to send: with
+        # the ASCII-copy workaround that is a %TEMP% copy, not the probe path.
         $back = Get-ClipboardFileList
-        if ($back -contains $probeScan) {
-            Write-Log 'OK: clipboard read-back confirms the FileDropList holds the probe'
+        if ($null -ne $script:LastClipboardPath -and $back -contains $script:LastClipboardPath) {
+            Write-Log "OK: clipboard read-back confirms the FileDropList holds $($script:LastClipboardPath)"
+            if (Test-Path -LiteralPath $script:LastClipboardPath -PathType Leaf) {
+                Write-Log 'OK: and that path exists as a file'
+            }
+            else {
+                Write-Log 'FAIL: the path on the clipboard does not exist'
+                $pass = $false
+            }
         }
         else {
-            Write-Log "FAIL: clipboard read-back did not hold the probe (got: $($back -join '; '))"
+            Write-Log "FAIL: clipboard read-back did not hold the expected path (expected '$($script:LastClipboardPath)', got: $($back -join '; '))"
             $pass = $false
         }
 
@@ -964,11 +1049,11 @@ function Invoke-SelfTest {
             }
 
             $back = Get-ClipboardFileList
-            if ($back -contains $probeEvent) {
-                Write-Log 'OK: clipboard read-back confirms the event path set the FileDropList'
+            if ($null -ne $script:LastClipboardPath -and $back -contains $script:LastClipboardPath) {
+                Write-Log "OK: clipboard read-back confirms the event path set the FileDropList to $($script:LastClipboardPath)"
             }
             else {
-                Write-Log "FAIL: clipboard read-back did not hold the event probe (got: $($back -join '; '))"
+                Write-Log "FAIL: clipboard read-back did not hold the expected path (expected '$($script:LastClipboardPath)', got: $($back -join '; '))"
                 $pass = $false
             }
 
