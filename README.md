@@ -14,7 +14,7 @@ xrdp 的 `cliprdr` 通道只实现了**文本**和**文件列表**两种剪贴�
 |---|---|
 | `winshot2clip.ps1` | 主程序：监听目录 + 把新截图放进剪贴板 + 写日志 |
 | `start-hidden.vbs` | 无窗口启动器（避免每次登录黑窗口一闪） |
-| `tests/logic-tests.ps1` | 逻辑回归测试（169 项断言，不依赖 Windows，任意平台的 pwsh 都能跑） |
+| `tests/logic-tests.ps1` | 逻辑回归测试（184 项断言，不依赖 Windows，任意平台的 pwsh 都能跑） |
 
 两个脚本都是**纯 ASCII**，这是刻意的：Windows PowerShell 5.1 在没有 UTF-8 BOM 时按系统 ANSI 代码页解析 `.ps1`，非 ASCII 字符会变乱码。纯 ASCII 意味着**你用任何方式传输都不会出问题，包括直接从 RDP 剪贴板粘贴到记事本另存**。中文路径照样能用（命令行参数是 UTF-16）。
 
@@ -133,7 +133,8 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
 | `-SettleTimeoutMs` | `5000` | 等文件停止增长的上限 |
 | `-PollMs` | `400` | 仅 `-Mode Poll`：扫描间隔 |
 | `-EventTimeoutSeconds` | `0` | 仅 `-Mode Watch`：覆盖单轮等待时长。主要为测试暴露，平时不用动。**注意**：兜底扫描就是由"某一轮没等到任何事件"触发的，所以调小它等于同时把兜底扫描的间隔也调小（它会覆盖 `-ReconcileSeconds`）|
-| `-KeepOriginalName` | 关（即默认做 ASCII 副本） | 把截图**原路径**放上剪贴板，而不是 `%TEMP%` 里的 ASCII 副本。默认关闭的原因见下文那个 xrdp 解析器 bug |
+| `-ClipboardMode` | `Shell` | **怎么把截图放上剪贴板**。`Shell`（默认）= 让资源管理器自己执行复制定词，与手动 `Ctrl+C` 是同一条代码路径；`FileDrop` = 直接 `SetFileDropList`（只提供 `CF_HDROP` 一种格式）；`AsciiCopy` = 先复制成 ASCII 文件名的副本再放路径 |
+| `-KeepOriginalName` | 关 | 仅 `AsciiCopy` 模式下生效：放原路径而不是 `%TEMP%` 副本 |
 | `-LogPath` | `%USERPROFILE%\winshot2clip.log` | 日志路径 |
 | `-Once <路径>` | — | 一次性模式：把指定文件放进剪贴板后退出 |
 | `-SelfTest` | — | 自检模式 |
@@ -164,17 +165,19 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
 
 **去重按"文件版本"而不是按"路径"。** `$seen` 存的是 `路径 → (长度+mtime)`，而不是一堆路径。所以：截图工具**覆写同名文件**（固定文件名、或者旧式的 `Screenshot (1).png` 复用编号）时，新内容照样会被复制；而同一个文件因为重复事件被看多次时，不会反复刷剪贴板。签名只在 `Get-FileSignature` 一处构造，两边比对不可能对不上。
 
-**为什么默认要先把截图复制成 ASCII 文件名的副本再放上剪贴板。**
+**默认为什么是 `Shell` 模式，而不是直接 `SetFileDropList`。**
 
-这是本项目目前最重要的一个约束，因为它决定了"能不能粘贴"。xrdp 解析剪贴板文件列表的代码用 `wcstombs()` 的返回值计算要跳过多少字节，**对 ASCII 文件名正确，对非 ASCII 文件名算得太短**（上游 issue #1992，同一区域后来还在 PR #1996 里补了缓冲区越界检查）。后果是：一个文件列表里**只有第一个文件描述符被正确读出**，而且剪贴板通道会被拖死——表现为"**第一张图能粘，之后就都不行了，连文字也一起死**"，且断开重连才能恢复。
+你要的动作是「把在资源管理器里手动 `Ctrl+C` 一个文件这一步自动化」。最保真的做法不是自己拼剪贴板内容，而是**让资源管理器自己做这次复制**：`Shell.Application` 是跑在 `explorer.exe` 里的 out-of-process COM 服务，要求它执行文件的 `copy` 动词，剪贴板内容就与手动 `Ctrl+C` 一致（包括 `SetFileDropList` 根本构造不出的 `Shell IDList Array`）。
 
-Windows 的截图文件名是**按系统语言**生成的，所以中文安装上每一张截图的名字都是非 ASCII，每一张都会命中那个解析器。因此：
+`InvokeVerb` 是**异步**的（它只是往 explorer 的消息循环里投一条消息），所以代码会轮询剪贴板确认文件真的上去了；没上去就当成失败并计一次重试，而不是记一行假的“复制成功”。
 
-1. 截图被发现后，先 `Copy-Item` 到 `%TEMP%\winshot2clip\shot-<时间戳>-<序号>.png`
-2. 把**这个副本**的路径放上剪贴板
-3. 副本目录只保留最新 20 个
+另外两个模式保留着：`FileDrop` 最朴素（只提供 `CF_HDROP`），`AsciiCopy` 用来绕开下面那个上游 xrdp bug。
 
-内容按字节完全相同，所以下游除名字外无法分辨。`-KeepOriginalName` 可以关掉这个行为，但除非你确定自己的截图是纯英文名、或者已升级到修好的 xrdp，否则不要关。
+**`AsciiCopy` 模式存在的原因（上游 xrdp bug）。** xrdp 解析剪贴板文件列表的代码用 `wcstombs()` 的返回值计算要跳过多少字节，**对 ASCII 文件名正确，对非 ASCII 文件名算得太短**（上游 issue #1992，同一区域后来还在 PR #1996 里补了越界检查）。后果是一个文件列表里**只有第一个文件描述符被正确读出**。
+
+Windows 的截图文件名**按系统语言**生成，所以中文安装上每张截图的名字都是非 ASCII。`AsciiCopy` 的做法是先 `Copy-Item` 到 `%TEMP%\winshot2clip\shot-<时间戳>-<序号>.png`，把副本路径放上剪贴板，内容字节完全相同；副本目录只保留最新 20 个。
+
+注意：**这只是改善上游解析器读到的名字长度，不能修复上游服务器侧的卡死**。如果你实际遇到的是“第一张能粘、之后都不行、连文字也一起死”且重连才恢复，那是客户端剪贴板被长期占住（Windows 事件日志里会看到 `SetFileDropList` 报“所请求的剪贴板操作失败”，即 `CLIPBRD_E_CANT_OPEN`），换模式未必能解决——先确认 `Shell` 模式重连后的实际表现。
 
 ## 平台行为探测记录（在 Linux/inotify 上做的，Windows 待验证）
 
@@ -204,7 +207,7 @@ SourceEventArgs = System.IO.FileSystemEventArgs  ← 正确读取位置
 
 我在 NixOS 上，**没有 Windows 环境**，所以边界说清楚。
 
-**已实测（169 项断言，连跑三遍全绿、退出码 0，`tests/logic-tests.ps1`）**
+**已实测（184 项断言，连跑三遍全绿、退出码 0，`tests/logic-tests.ps1`）**
 
 其中约 60 项是审计之后补的回归断言，每一条锁一个具体缺陷。测试 harness 现在从生产源码里读配置值（`$script:Extensions` / `MaxAttempts` / `EventSource`），所以改生产配置会真的让测试跟着变——而不是继续默默地测旧值。
 

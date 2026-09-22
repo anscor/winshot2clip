@@ -2,22 +2,31 @@
     winshot2clip.ps1
 
     Watches the Windows screenshot folder. Whenever a new screenshot file
-    appears, it puts THAT FILE on the clipboard in the FileDrop (CF_HDROP)
-    format -- exactly what Explorer does when you click a file and press
-    Ctrl+C. The paste path itself does not change at all; only the
-    "somebody has to find the file and press Ctrl+C" step is automated.
+    appears, it puts THAT FILE on the clipboard -- exactly what Explorer does
+    when you click a file and press Ctrl+C. The paste path itself does not
+    change at all; only the "somebody has to find the file and press Ctrl+C"
+    step is automated. Your screenshot tool keeps doing the saving.
 
-    Why the file, and not the bitmap:
-      xrdp's cliprdr channel carries TEXT and FILE LISTS. It has no
-      implementation for bitmap (CF_DIB) transfer, which is precisely why
-      a bitmap sitting in the Windows clipboard never reaches the Linux
-      side. Calling Clipboard::SetImage() would go down that same dead end.
+    How the copy is made (-ClipboardMode):
+      Shell (default) -- Shell.Application runs in explorer.exe, so asking it
+        for the file's "copy" verb makes Explorer perform the copy. Expect the
+        same clipboard contents as a manual Ctrl+C, because it is the same code
+        path. Shell IDList Array and Preferred DropEffect come along for free.
+      FileDrop -- put the path on the clipboard directly with
+        SetFileDropList, which offers only CF_HDROP.
+      AsciiCopy -- copy to an ASCII-named file in %TEMP% first, to dodge an
+        upstream xrdp bug with non-ASCII names (issue #1992).
+
+    Why not put the bitmap on the clipboard instead:
+      That is what a manual "copy image" does, and it works over RDP. But it
+      is a different task: this tool automates the file copy you do by hand,
+      which is what keeps the screenshot as a file with its real name.
 
     Why the clipboard content is still there after this script exits:
-      Clipboard::SetFileDropList() internally calls
-      SetDataObject(dataObject, copy: true), which renders the data onto
-      the clipboard (OleFlushClipboard) instead of leaving a pointer owned
-      by our process. So Ctrl+V keeps working minutes later, from any app.
+      The shell's copy is rendered onto the clipboard by the shell itself, and
+      SetFileDropList() internally calls SetDataObject(dataObject, copy: true) --
+      OleFlushClipboard -- so the data is not left behind as a pointer owned by
+      our process. Either way Ctrl+V keeps working minutes later, from any app.
 
     How it watches (-Mode Watch, the default):
       FileSystemWatcher, but registered WITHOUT -Action. That distinction
@@ -98,6 +107,27 @@ param(
 
     [string] $LogPath = (Join-Path $env:USERPROFILE 'winshot2clip.log'),
 
+    # HOW to put the screenshot on the clipboard. All three put a FILE on the
+    # clipboard; they differ in who does it.
+    #
+    #   Shell (default) -- ask the shell to run the "copy" verb on the file.
+    #     Shell.Application is an out-of-process COM server living in
+    #     explorer.exe, so the copy is performed by Explorer itself. This is the
+    #     closest possible reproduction of selecting the file and pressing
+    #     Ctrl+C by hand: same code path, same clipboard contents, including the
+    #     Shell IDList Array that cannot reasonably be built by hand.
+    #
+    #   FileDrop -- put the path on the clipboard with SetFileDropList. Plain,
+    #     but it offers only the CF_HDROP format, whereas Explorer also offers
+    #     FileNameW, Shell IDList Array and Preferred DropEffect.
+    #
+    #   AsciiCopy -- copy the screenshot to an ASCII-named file in %TEMP% and
+    #     put THAT path on the clipboard. A workaround for the upstream xrdp
+    #     bug where a non-ASCII name makes the file-list parser read only the
+    #     first entry (issue #1992).
+    [ValidateSet('Shell', 'FileDrop', 'AsciiCopy')]
+    [string] $ClipboardMode = 'Shell',
+
     # xrdp parses the clipboard file list with a length derived from wcstombs(),
     # which is wrong for names that are not plain ASCII. Upstream issue #1992:
     # only the first file descriptor is read correctly and the clipboard channel
@@ -108,6 +138,8 @@ param(
     # So by default each screenshot is copied to an ASCII-named file under
     # %TEMP% and THAT path is what goes on the clipboard. Use this switch to
     # put the original path on the clipboard instead.
+    #
+    # Only relevant with -ClipboardMode File.
     [switch] $KeepOriginalName,
 
     # Diagnostic mode: exercises the whole detect -> clipboard -> read-back
@@ -126,6 +158,7 @@ $script:Extensions  = @('.png', '.jpg', '.jpeg')
 $script:MaxAttempts = 3
 $script:EventSource = 'WinShot2Clip'
 $script:KeepOriginalName = [bool] $KeepOriginalName
+$script:ClipboardMode = $ClipboardMode
 $script:ClipSerial = 0
 
 # The path most recently handed to the clipboard. With the ASCII-copy workaround
@@ -386,6 +419,85 @@ function Set-ClipboardFile {
     }
 }
 
+function Set-ClipboardFileByShellVerb {
+    <#
+        Ask the shell itself to copy the file, the way a manual Ctrl+C in
+        Explorer does.
+
+        Shell.Application is an out-of-process COM server running inside
+        explorer.exe, so the clipboard ends up holding exactly what a manual
+        copy produces, including the Shell IDList Array that a hand-built data
+        object could not reasonably reproduce.
+    #>
+    param([Parameter(Mandatory = $true)][string] $Path)
+
+    $directory = Split-Path -Parent $Path
+    $leaf      = Split-Path -Leaf $Path
+
+    $shell  = New-Object -ComObject Shell.Application
+    $folder = $shell.Namespace($directory)
+    if ($null -eq $folder) { throw "shell cannot open folder: $directory" }
+
+    $item = $folder.ParseName($leaf)
+    if ($null -eq $item) { throw "shell cannot find item: $leaf" }
+
+    # The canonical verb name, not the localised menu text.
+    $item.InvokeVerb('copy')
+}
+
+function Test-ClipboardHoldsFile {
+    <#
+        True when the file is already on the clipboard as a file drop.
+
+        Polled rather than assumed: InvokeVerb posts to explorer's message loop
+        and returns before the copy has happened.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [int] $TimeoutSeconds = 5
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        foreach ($entry in @(Get-ClipboardFileList)) {
+            if ($entry -eq $Path) { return $true }
+        }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Milliseconds 100
+    }
+}
+
+function Set-ClipboardForScreenshot {
+    <#
+        The one place that decides how a screenshot reaches the clipboard.
+
+        Returns the path that ended up on the clipboard plus the attempt count.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string] $Path,
+        [Parameter(Mandatory = $true)][string] $Mode,
+        [switch] $KeepOriginalName
+    )
+
+    switch ($Mode) {
+        'Shell' {
+            Set-ClipboardFileByShellVerb -Path $Path
+            if (-not (Test-ClipboardHoldsFile -Path $Path)) {
+                throw "the shell did not put $Path on the clipboard"
+            }
+            return @{ Path = $Path; Attempts = 1 }
+        }
+        'AsciiCopy' {
+            $payload = $Path
+            if (-not $KeepOriginalName) { $payload = Copy-ForClipboard -Path $Path }
+            return @{ Path = $payload; Attempts = (Set-ClipboardFile -Path $payload) }
+        }
+        default {
+            return @{ Path = $Path; Attempts = (Set-ClipboardFile -Path $Path) }
+        }
+    }
+}
+
 function Get-ClipboardFileList {
     try {
         $list = [System.Windows.Forms.Clipboard]::GetFileDropList()
@@ -438,31 +550,23 @@ function Copy-ScreenshotFile {
     # clipboard, and the one $Seen has to remember.
     $signature = Get-FileSignature -Path $Path
 
-    # What actually goes on the clipboard. See -KeepOriginalName for why this is
-    # normally an ASCII copy rather than the screenshot itself.
-    $clipboardPath = $Path
-    if (-not $script:KeepOriginalName) {
-        try {
-            $clipboardPath = Copy-ForClipboard -Path $Path
-        }
-        catch {
-            Write-Log "WARN: cannot make an ASCII copy of $Path ($($_.Exception.Message)); sending the original name"
-            $clipboardPath = $Path
-        }
-    }
-
+    # What actually goes on the clipboard, and how. The shell does the copy in
+    # the default mode, so the announced path is normally the screenshot's own
+    # path; only AsciiCopy substitutes a %TEMP% copy.
     try {
-        $attempts = Set-ClipboardFile -Path $clipboardPath
-        $script:LastClipboardPath = $clipboardPath
+        $result = Set-ClipboardForScreenshot -Path $Path -Mode $script:ClipboardMode `
+                                            -KeepOriginalName:$script:KeepOriginalName
+        $script:LastClipboardPath = $result.Path
         $Seen[$Path] = $signature
         if ($Pending.ContainsKey($Path)) { $Pending.Remove($Path) }
+
         $suffix = ''
-        if ($attempts -gt 1) { $suffix = " ({0} attempts)" -f $attempts }
-        if ($clipboardPath -ne $Path) {
-            Write-Log "clipboard set${suffix}: $clipboardPath  (ASCII copy of $Path)"
+        if ($result.Attempts -gt 1) { $suffix = " ({0} attempts)" -f $result.Attempts }
+        if ($result.Path -ne $Path) {
+            Write-Log "clipboard set${suffix}: $($result.Path)  (copy of $Path)"
         }
         else {
-            Write-Log "clipboard set${suffix}: $clipboardPath"
+            Write-Log "clipboard set${suffix} [$($script:ClipboardMode)]: $($result.Path)"
         }
         return $true
     }

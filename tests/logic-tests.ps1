@@ -166,6 +166,14 @@ if ($null -ne $ast.ParamBlock) {
     $prodKeepOriginalParam = @($ast.ParamBlock.Parameters |
                               Where-Object { $_.Name.VariablePath.UserPath -eq 'KeepOriginalName' })[0]
 }
+$prodModeParam = @(Get-ProductionParamDefault -ScriptAst $ast -Name 'ClipboardMode')
+$prodModeDefault = $null
+if ($prodModeParam.Count -gt 0) { $prodModeDefault = $prodModeParam[0] }
+
+# The state-machine tests drive the clipboard through the fake below. They run in
+# FileDrop mode so that the path they observe is predictable and no shell is
+# needed. Shell mode gets its own structural and dispatch tests instead.
+$testClipboardMode = 'FileDrop'
 
 # The preamble goes into the same scriptblock as the definitions, so whatever
 # $script: resolves to, the functions and these values agree.
@@ -175,6 +183,7 @@ $preamble = @"
 `$script:MaxAttempts      = $prodMaxAttempts
 `$script:EventSource      = '$prodEventSource'
 `$script:KeepOriginalName = `$true
+`$script:ClipboardMode    = '$testClipboardMode'
 `$script:ClipSerial       = 0
 `$script:LastClipboardPath = `$null
 "@
@@ -843,14 +852,90 @@ Assert 'and -SelfTest can build both probes for the default filter' `
        ($null -ne (Get-ProbeName -Pattern $prodFilter -Stamp '20260922-224547' -Kind 'scan') -and
         $null -ne (Get-ProbeName -Pattern $prodFilter -Stamp '20260922-224547' -Kind 'event'))
 
-Section 'the ASCII-copy workaround is the production default'
+Section 'clipboard modes: Shell is the production default'
 
-Assert 'production declares -KeepOriginalName' ($null -ne $prodKeepOriginalParam)
-Assert 'and it is a switch' `
-       ($null -ne $prodKeepOriginalParam -and $prodKeepOriginalParam.StaticType.Name -eq 'SwitchParameter') `
-       "got $($prodKeepOriginalParam.StaticType.Name)"
-Assert 'with no default, so the ASCII copy is used unless asked otherwise' `
-       ($null -ne $prodKeepOriginalParam -and $null -eq $prodKeepOriginalParam.DefaultValue)
+Assert 'production declares -ClipboardMode' ($null -ne $prodModeDefault)
+Assert 'and it defaults to Shell, i.e. let Explorer do the copy' ($prodModeDefault -eq 'Shell') "got '$prodModeDefault'"
+
+$modeSet = @()
+if ($null -ne $ast.ParamBlock) {
+    $mp = @($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'ClipboardMode' })[0]
+    foreach ($attr in $mp.Attributes) {
+        if ($attr -is [System.Management.Automation.Language.AttributeAst] -and $attr.TypeName.Name -eq 'ValidateSet') {
+            $modeSet = @($attr.PositionalArguments | ForEach-Object { $_.Value })
+        }
+    }
+}
+Assert 'the allowed modes are Shell, FileDrop and AsciiCopy' `
+       (($modeSet -join ',') -eq 'Shell,FileDrop,AsciiCopy') "got '$($modeSet -join ',')'"
+
+# The shell mode must actually drive the shell, and it must verify the result
+# rather than trust InvokeVerb (which is asynchronous and can silently do
+# nothing, for instance if the item has no copy verb).
+$shellCall = @($funcAst['Set-ClipboardForScreenshot'].FindAll({
+    param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+              $n.GetCommandName() -eq 'Set-ClipboardFileByShellVerb'
+}, $true))
+Assert 'Shell mode calls Set-ClipboardFileByShellVerb' ($shellCall.Count -eq 1) "got $($shellCall.Count)"
+
+$shellBody = $funcAst['Set-ClipboardFileByShellVerb'].Extent.Text
+Assert 'the shell verb is the canonical copy name, not a localised menu string' `
+       ($shellBody -match "InvokeVerb\('copy'\)")
+Assert 'and it resolves the folder through Shell.Application (so explorer does the copy)' `
+       ($shellBody -match 'New-Object -ComObject Shell\.Application')
+
+$verifyCall = @($funcAst['Set-ClipboardForScreenshot'].FindAll({
+    param($n) $n -is [System.Management.Automation.Language.CommandAst] -and
+              $n.GetCommandName() -eq 'Test-ClipboardHoldsFile'
+}, $true))
+Assert 'Shell mode verifies the file really landed on the clipboard' ($verifyCall.Count -eq 1) "got $($verifyCall.Count)"
+
+$holdsBody = $funcAst['Test-ClipboardHoldsFile'].Extent.Text
+Assert 'the verification polls (InvokeVerb returns before the copy happens)' ($holdsBody -match 'Start-Sleep')
+Assert 'and it has a bounded timeout' ($holdsBody -match 'AddSeconds')
+
+Section 'clipboard mode dispatch'
+
+# Drive Set-ClipboardForScreenshot directly, with the shell functions replaced,
+# so each mode's contract is checked rather than inferred.
+$dispatchDir = New-TestDir 'mode-dispatch'
+$dispatchShot = New-Probe $dispatchDir 'Screenshot dispatch.png'
+
+$shellCalls = New-Object System.Collections.ArrayList
+function Set-ClipboardFileByShellVerb { param([string] $Path) [void] $shellCalls.Add($Path) }
+function Test-ClipboardHoldsFile { param([string] $Path, [int] $TimeoutSeconds = 5) return $true }
+
+$r = Set-ClipboardForScreenshot -Path $dispatchShot -Mode 'Shell'
+Assert 'Shell mode hands the original path to the shell' ($shellCalls.Count -eq 1 -and $shellCalls[0] -eq $dispatchShot)
+Assert 'and reports that same path as what is on the clipboard' ($r.Path -eq $dispatchShot)
+Assert 'and needs no retries (the shell is not racing the clipboard)' ($r.Attempts -eq 1)
+
+$global:Calls.Clear()
+$r = Set-ClipboardForScreenshot -Path $dispatchShot -Mode 'FileDrop'
+Assert 'FileDrop mode calls Set-ClipboardFile with the original path' `
+       ($global:Calls.Count -eq 1 -and $global:Calls[0] -eq $dispatchShot) "got '$($global:Calls -join '; ')'"
+Assert 'and reports the original path' ($r.Path -eq $dispatchShot)
+
+$global:Calls.Clear()
+$r = Set-ClipboardForScreenshot -Path $dispatchShot -Mode 'AsciiCopy'
+Assert 'AsciiCopy mode calls Set-ClipboardFile with a different path' `
+       ($global:Calls.Count -eq 1 -and $global:Calls[0] -ne $dispatchShot) "got '$($global:Calls -join '; ')'"
+Assert 'and that path is ASCII' `
+       (@($r.Path.ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count -eq 0) "got '$($r.Path)'"
+
+$global:Calls.Clear()
+$r = Set-ClipboardForScreenshot -Path $dispatchShot -Mode 'AsciiCopy' -KeepOriginalName
+Assert 'AsciiCopy + -KeepOriginalName falls back to the original path' `
+       ($r.Path -eq $dispatchShot) "got '$($r.Path)'"
+
+# A shell that silently does nothing must be treated as a failure, not logged
+# as a successful copy.
+function Test-ClipboardHoldsFile { param([string] $Path, [int] $TimeoutSeconds = 5) return $false }
+$threw = $false
+try { $null = Set-ClipboardForScreenshot -Path $dispatchShot -Mode 'Shell' } catch { $threw = $true }
+Assert 'Shell mode fails loudly when the copy did not land on the clipboard' $threw
+
+Section 'A16: the watcher is armed before the baseline is primed'
 
 Section 'xrdp file-list parser workaround (ASCII name on the clipboard)'
 
@@ -882,6 +967,10 @@ Assert 'two screenshots do not collide on the same ASCII name' `
 $kept = @(Get-ChildItem -LiteralPath (Split-Path -Parent $copied) -File -ErrorAction SilentlyContinue).Count
 Assert 'the temp directory is bounded (it does not grow without limit)' ($kept -le 25) "$kept file(s)"
 
+# The end-to-end shape for the default mode is covered in the mode-dispatch
+# section above; here the AsciiCopy mode is exercised through the real pipeline.
+$script:ClipboardMode = 'AsciiCopy'
+
 # The real end-to-end shape: a Chinese-named screenshot goes in, and what lands
 # on the clipboard is an existing ASCII-named file with the same bytes.
 $dirE2E = New-TestDir 'ascii-e2e'
@@ -902,6 +991,9 @@ Assert 'end to end: it exists and matches the screenshot byte count' `
 Assert 'end to end: the screenshot itself is what is remembered as seen' ($seenE2E.ContainsKey($e2eShot))
 
 # The switch must actually restore the old behaviour.
+# The switch must still restore the old behaviour, but it only applies to the
+# AsciiCopy mode now.
+$script:ClipboardMode = 'AsciiCopy'
 $script:KeepOriginalName = $true
 $dirKeep = New-TestDir 'keep-original'
 $keepShot = Join-Path $dirKeep ('{0} keep.png' -f $localisedPrefix2)
@@ -930,6 +1022,10 @@ Assert 'by default the non-ASCII path is NOT what goes on the clipboard' `
 Assert 'and what does go on is ASCII' `
        ($global:Calls.Count -eq 1 -and @($global:Calls[0].ToCharArray() | Where-Object { [int]$_ -gt 127 }).Count -eq 0) `
        "got '$($global:Calls -join '; ')'"
+
+# Restore the mode the rest of the state-machine tests run in.
+$script:ClipboardMode = $testClipboardMode
+$script:KeepOriginalName = $true
 
 Section 'A16: the watcher is armed before the baseline is primed'
 
