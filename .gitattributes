@@ -1,0 +1,5 @@
+# 两个 Windows 脚本由 WScript 和 powershell.exe 执行，强制 checkout 为 CRLF，
+# 避免依赖克隆者本地的 core.autocrlf（WSH 对 LF-only 的 .vbs 有过报语法错误的记录）。
+# 其余文本文件保持 LF。
+*.ps1 text eol=crlf
+*.vbs text eol=crlf
